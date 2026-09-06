@@ -754,6 +754,36 @@ def test_parse_request_rejects_hidden_state_token_mismatch() -> None:
         _pipeline_shell()._parse_request(_batch(prompt=prompt))
 
 
+@pytest.mark.parametrize(
+    ("height", "width", "message"),
+    [
+        (0, 32, "Invalid image size"),
+        (32, -1, "Invalid image size"),
+        (30, 32, "multiples of 16"),
+        (32, 31, "multiples of 16"),
+    ],
+)
+def test_parse_request_rejects_invalid_image_size(height, width, message) -> None:
+    prompt = {
+        "prompt": "",
+        "height": height,
+        "width": width,
+        "additional_information": {
+            "full_hidden_states": torch.zeros(4, 8),
+            "full_token_ids": [10, 11, 100, 101],
+            "answer_start_index": 2,
+        },
+    }
+    with pytest.raises(ValueError, match=message):
+        _pipeline_shell()._parse_request(_batch(prompt=prompt))
+
+
+def test_parse_request_rejects_explicit_zero_steps() -> None:
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=0)
+    with pytest.raises(ValueError, match="num_inference_steps must be positive"):
+        _pipeline_shell()._parse_request(_batch(sampling=sampling))
+
+
 def test_dummy_request_synthesizes_conditions_without_ar_output() -> None:
     parsed = _pipeline_shell()._parse_request(
         _batch(
@@ -870,8 +900,19 @@ Add this method to `MammothModa2DiTPipeline`:
                     f"request_id={req.request_id}"
                 )
 
-        height = DiffusionRequestBatch.get_prompt_field(prompt, "height") or sampling.height or 1024
-        width = DiffusionRequestBatch.get_prompt_field(prompt, "width") or sampling.width or 1024
+        height = DiffusionRequestBatch.get_prompt_field(prompt, "height")
+        width = DiffusionRequestBatch.get_prompt_field(prompt, "width")
+        height = sampling.height if height is None else height
+        width = sampling.width if width is None else width
+        height = 1024 if height is None else int(height)
+        width = 1024 if width is None else int(width)
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid image size: {height}x{width}; request_id={req.request_id}")
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                "Image size must be multiples of 16, "
+                f"got {height}x{width}; request_id={req.request_id}"
+            )
         extra_args = sampling.extra_args or {}
         if "text_guidance_scale" in extra_args:
             text_guidance_scale = float(extra_args["text_guidance_scale"])
@@ -879,7 +920,12 @@ Add this method to `MammothModa2DiTPipeline`:
             text_guidance_scale = float(sampling.guidance_scale)
         else:
             text_guidance_scale = 9.0
-        num_inference_steps = int(extra_args.get("num_inference_steps", sampling.num_inference_steps or 50))
+        raw_num_inference_steps = extra_args.get("num_inference_steps")
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = sampling.num_inference_steps
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = 50
+        num_inference_steps = int(raw_num_inference_steps)
         raw_cfg_range = extra_args.get("cfg_range", [0.0, 1.0])
         if not isinstance(raw_cfg_range, (list, tuple)) or len(raw_cfg_range) != 2:
             raise ValueError("MammothModa2 cfg_range must contain two values")
@@ -894,8 +940,8 @@ Add this method to `MammothModa2DiTPipeline`:
             full_hidden_states=full_hidden_states,
             full_token_ids=[int(token_id) for token_id in full_token_ids],
             answer_start_index=answer_start_index,
-            height=int(height),
-            width=int(width),
+            height=height,
+            width=width,
             text_guidance_scale=text_guidance_scale,
             cfg_range=cfg_range,
             num_inference_steps=num_inference_steps,
@@ -1137,13 +1183,6 @@ Replace the legacy `forward` method with:
             generator = torch.Generator(device=prompt_embeds.device).manual_seed(request.seed)
 
         height, width = request.height, request.width
-        if height <= 0 or width <= 0:
-            raise ValueError(f"Invalid image size: {height}x{width}; request_id={request.request_id}")
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(
-                "Image size must be multiples of 16, "
-                f"got {height}x{width}; request_id={request.request_id}"
-            )
         vae_scale_factor = 16
         latent_channels = int(self.gen_transformer.config.in_channels)
         shape = (1, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
