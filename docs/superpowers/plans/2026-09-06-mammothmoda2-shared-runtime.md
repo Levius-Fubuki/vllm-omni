@@ -1050,12 +1050,6 @@ Replace the legacy `forward` method with:
             answer_start_index=request.answer_start_index,
         )
 
-        model_device = next(self.parameters()).device
-        if self.gen_image_condition_refiner is not None:
-            target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
-        else:
-            target_dtype = next(self.gen_transformer.parameters()).dtype
-
         if image_cond.shape[0] == 0:
             answer_token_ids = request.full_token_ids[request.answer_start_index :]
             raise ValueError(
@@ -1063,6 +1057,13 @@ Replace the legacy `forward` method with:
                 "the DiT stage requires at least one generated visual token; "
                 f"request_id={request.request_id}; generated_token_ids={answer_token_ids[:32]}"
             )
+
+        model_device = next(self.parameters()).device
+        if self.gen_image_condition_refiner is not None:
+            target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
+        else:
+            target_dtype = next(self.gen_transformer.parameters()).dtype
+
         text_cond = text_cond.to(
             device=model_device,
             dtype=target_dtype,
