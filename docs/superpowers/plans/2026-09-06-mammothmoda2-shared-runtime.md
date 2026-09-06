@@ -513,14 +513,15 @@ Expected: collection fails because `_build_mammoth_config` and `_root_weight_sou
 
 - [ ] **Step 3: Replace legacy config imports and add native helpers**
 
-At the top of `pipeline_mammothmoda2_dit.py`, change the typing import to
-`from typing import ClassVar`, remove `VllmConfig` and `OmniOutput`, and add:
+At the top of `pipeline_mammothmoda2_dit.py`, remove `VllmConfig` and add the
+native construction imports below. Keep `Any` and `OmniOutput` until Task 4 so
+the legacy `forward` remains internally valid throughout this intermediate
+commit.
 
 ```python
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 ```
 
 Add these helpers above the pipeline class:
@@ -578,11 +579,10 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 ```
 
 Keep the existing module construction, caption embedder setup, optional refiner
-selection, and RoPE construction immediately after this setup. Delete the
-legacy `have_multimodal_outputs` flag,
-`get_dummy_runtime_additional_information`, `make_empty_intermediate_tensors`,
-`embed_input_ids`, and `compute_logits` compatibility members; native dummy
-requests and `DiffusionOutput` replace those generation-runner contracts.
+selection, RoPE construction, legacy `forward`, and generation-runner
+compatibility members through this task. Task 4 replaces the runtime contract
+and removes those members in the same commit, so every intermediate revision
+remains importable and passes static checks.
 
 - [ ] **Step 5: Run configuration tests**
 
@@ -786,12 +786,15 @@ python -m pytest \
 
 Expected: the new tests fail with `AttributeError: ... has no attribute '_parse_request'`.
 
-- [ ] **Step 3: Add a typed request boundary**
+- [ ] **Step 3: Add the native request imports and a typed request boundary**
 
-Add the `dataclass` import, then define:
+Add the `dataclass` import, import the shared request/output types, and define:
 
 ```python
 from dataclasses import dataclass
+
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1209,13 @@ Replace the legacy `forward` method with:
 ```
 
 Keep `load_weights` unchanged: the native loader now feeds it the root checkpoint source added in Task 3, and the existing mapper filters `llm_model.*` and `gen_tokenizer.*`.
+
+After replacing `forward`, change the typing import to
+`from typing import ClassVar`, remove the `OmniOutput` import, and delete the
+legacy `have_multimodal_outputs` flag,
+`get_dummy_runtime_additional_information`, `make_empty_intermediate_tensors`,
+`embed_input_ids`, and `compute_logits` members. Native dummy requests and
+`DiffusionOutput` now own those contracts, and `Any` is no longer used.
 
 - [ ] **Step 8: Run all pipeline contract tests**
 
