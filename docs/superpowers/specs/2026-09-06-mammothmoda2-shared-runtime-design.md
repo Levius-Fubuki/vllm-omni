@@ -61,16 +61,18 @@ configuration change cannot accidentally claim batching support.
 
 ### AR-to-DiT bridge
 
-The existing `ar2dit` processor remains responsible for reconstructing the
+The renamed `ar2diffusion` processor remains responsible for reconstructing the
 ordered AR payload:
 
 - prompt token IDs plus generated visual token IDs;
 - token-aligned hidden states;
 - the question/answer boundary;
 - target image height and width;
-- guidance scale, CFG interval, denoising-step count, and seed-bearing sampling
-  parameters;
-- the logical request identity supplied by the shared request lifecycle.
+- the prompt payload associated with the logical request identity.
+
+Guidance scale, CFG interval, denoising-step count, and seed stay on the
+request-local diffusion sampling parameters; the orchestrator preserves the
+logical request identity when it constructs the downstream request.
 
 The bridge will emit the prompt/additional-information shape expected by an
 `OmniDiffusionRequest`. It will not split text and image conditioning itself;
@@ -151,8 +153,9 @@ by a focused failing test.
    module path.
 3. Pipeline construction consumes `OmniDiffusionConfig` and preserves component
    discovery.
-4. `ar2dit` preserves token-aligned hidden states, dimensions, sampling values,
-   and request-scoped prompt data.
+4. `ar2diffusion` preserves token-aligned hidden states, dimensions, and
+   request-scoped prompt data; the downstream request preserves sampling
+   values.
 5. Single-request forward input is decoded from `DiffusionRequestBatch` and the
    result uses `DiffusionOutput`.
 6. Multi-request input and each malformed AR payload fail with a stable,
@@ -160,20 +163,23 @@ by a focused failing test.
 7. Existing MammothModa2 configuration, stage-input, and AR-only tests remain
    green.
 
-Heavy model modules will be constructed with small test doubles only at external
-weight-loading boundaries. Tests should exercise the real request parsing,
-validation, and output-building code rather than asserting mock call counts.
+Heavy model modules will be replaced with small test doubles at external
+weight-loading boundaries. Tests exercise the real request parsing, validation,
+and output-building code; a transformer call count is asserted only to prove
+the requested denoising-step count is honored.
 
 ### A800 validation
 
 GPU work begins only after CPU tests and static checks pass.
 
-1. **Single A800 80GB:** establish the legacy baseline and shared-runtime smoke
-   test using MammothModa2-Preview, 1024x1024, 50 steps, guidance 4.0, seed 42.
+1. **Single A800 80GB:** run the shared-runtime E2E and smoke test using
+   MammothModa2-Preview, 1024x1024, 50 steps, guidance 4.0, seed 42.
 2. **Two A800 80GB in one host:** place AR on GPU 0 and DiT on GPU 1; run the
    same baseline and candidate revision on identical hardware.
-3. Warm each revision three times, then collect 30 measured requests for p50 and
-   p95 DiT latency, end-to-end latency, and peak GPU memory.
+3. Warm each revision once, then collect 10 serial measured requests for p50
+   and p95 DiT latency, end-to-end latency, and peak GPU memory. This is the
+   economical validation sample; it is evidence for regression detection, not
+   a publication-grade benchmark.
 4. Save the generated image, exact command, commit SHA, environment report, and
    profiler/log output. Confirm through logs that the shared diffusion backend
    executed stage 1 and no legacy fallback occurred.
@@ -218,4 +224,4 @@ The change is complete when all of the following are true:
 - targeted CPU tests and repository lint checks pass;
 - the dual-A800 run records baseline/candidate correctness, p50/p95 latency,
   peak memory, environment, and proof of shared-backend execution;
-- the PR uses `Refs #7075` and links #7086 without closing the umbrella issue.
+- the PR uses `Refs #7075` and `Closes #7086`, leaving umbrella issue #7075 open.
