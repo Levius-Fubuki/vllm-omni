@@ -151,6 +151,29 @@ per-request message, so it appears only after sending a text-to-image request
 with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
 generation model runner for stage 1 is a failed migration.
 
+#### Migration benchmark
+
+The request-mode migration was checked on 2x NVIDIA A800 80GB PCIe with AR on
+GPU 0 and DiT on GPU 1. Each revision ran one warmup followed by 10 serial
+measured requests in the same initialized process. Both used BF16 eager mode,
+1024x1024 output, 50 denoising steps, guidance scale 4.0, seed 42, and no
+diffusion cache. The baseline was the pre-migration revision `caed3061`; the
+candidate was `19de562a`. Lower latency is better.
+
+| Metric | Baseline p50 | Baseline p95 | Candidate p50 | Candidate p95 |
+| --- | ---: | ---: | ---: | ---: |
+| End-to-end latency | 105.36 s | 106.01 s | 104.94 s | 105.79 s |
+| AR stage latency | 86.97 s | 87.61 s | 86.26 s | 87.11 s |
+| DiT stage latency | 18.27 s | 18.41 s | 18.60 s | 18.62 s |
+
+Peak sampled device memory was 39,209 MiB on the AR GPU for both revisions.
+The DiT GPU used 11,089 MiB for the baseline and 10,967 MiB for the candidate.
+The candidate's shared runtime reported 372.02 ms p50 per denoising step and a
+5.89 ms p50 AR-to-diffusion adapter time. All measured requests completed and
+both revisions produced valid, prompt-aligned 1024x1024 RGB images. The small
+latency differences are regression evidence, not a statistically significant
+speedup claim.
+
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
 #### Environment
