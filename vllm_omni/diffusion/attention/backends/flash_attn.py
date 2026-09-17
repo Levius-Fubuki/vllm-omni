@@ -73,6 +73,7 @@ if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
         causal,
         deterministic,
     ):
+        # FA4 returns contiguous output even when Q is noncontiguous; V sets its head dimension.
         return query.new_empty((*query.shape[:-1], value.shape[-1]))
 
 
@@ -287,6 +288,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         from vllm_omni.diffusion.attention.backends.utils.fa import validate_fa4_head_dims
 
         try:
+            if query.dtype != key.dtype or query.dtype != value.dtype:
+                raise ValueError("Q, K, and V dtypes must match")
+            if query.device != key.device or query.device != value.device:
+                raise ValueError("Q, K, and V devices must match")
             if query.shape[-1] != key.shape[-1]:
                 raise ValueError("Q and K head dimensions must match")
             verified = validate_fa4_head_dims(query.shape[-1], value.shape[-1], 16 // value.element_size())

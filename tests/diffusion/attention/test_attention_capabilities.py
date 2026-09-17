@@ -318,3 +318,41 @@ def test_piecewise_dispatch_ignores_unused_incomplete_packed_metadata(monkeypatc
     monkeypatch.setattr(fa, "flash_attn_func", lambda *args, **kwargs: query)
     monkeypatch.setattr(flash_attn, "piecewise_attn", lambda *args, **kwargs: query)
     assert impl.forward_cuda(query, query, query, metadata) is query
+
+
+@pytest.mark.parametrize("input_index", [1, 2])
+@pytest.mark.parametrize("mismatch", ["dtype", "device"])
+def test_fa4_rejects_incompatible_key_value(input_index, mismatch):
+    tensors = [torch.empty((1, 16, 8, 64), dtype=torch.bfloat16) for _ in range(3)]
+    tensors[input_index] = (
+        tensors[input_index].to(dtype=torch.float16) if mismatch == "dtype" else tensors[input_index].to("meta")
+    )
+    result = _impl().resolve_execution_path(ExecutionContext(platform="cuda"), *tensors, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert f"{mismatch}s must match" in result.support.reason
+
+
+@pytest.mark.parametrize("skip_quant", [False, True])
+def test_layer_resolution_uses_effective_kv_quantization(skip_quant):
+    from vllm_omni.diffusion.attention.layer import Attention
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+
+    layer = Attention.__new__(Attention)
+    torch.nn.Module.__init__(layer)
+    layer.attention = _impl(kernel_variant=None)
+    layer._hsdp_compile_boundary_enabled = False
+    layer._no_parallel_strategy = NoParallelAttention()
+    layer.parallel_strategy = layer._no_parallel_strategy
+    layer.use_ring = False
+    layer.paged_kv_cache_role = None
+    layer._kv_cache_dtype = "fp8"
+    layer._disable_kv_quant = False
+    layer._kv_cache_skip_steps = None
+    layer._kv_cache_skip_layers = {0} if skip_quant else None
+    layer.layer_idx = 0
+    query = torch.empty((1, 16, 8, 64), dtype=torch.bfloat16)
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8"})
+    result = layer.resolve_execution_path(ExecutionContext(platform="npu"), query, query, query, metadata)
+    assert result.path == ("npu_dense" if skip_quant else "npu_unverified")
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert metadata.extra == {"kv_cache_dtype": "fp8"}

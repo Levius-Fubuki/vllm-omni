@@ -436,6 +436,8 @@ class Attention(nn.Module):
                 type(self.attention).__name__,
                 resolved_context,
             )
+        if not resolved_context.paged_kv:
+            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
         return resolver(
             resolved_context,
             query,

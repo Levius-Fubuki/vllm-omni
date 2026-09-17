@@ -24,7 +24,8 @@ other unmigrated paths report `UNMIGRATED` with advisory `EAGER_ONLY` defaults.
 or change existing execution.
 
 FA4 execution uses an opaque custom op. Its fake output preserves Q's batch,
-sequence, and head count and uses V's head dimension. Metadata normalization is
+sequence, and head count and uses V's head dimension. Output is contiguous even
+when Q is noncontiguous. Metadata normalization is
 shared with dispatch. Producers must update published mask semantics when masks
 change; unpublished masks remain runtime-dependent to avoid synchronization.
 Callers resolve again when execution metadata changes.
@@ -121,6 +122,12 @@ Tested environment: GB300, PyTorch `2.13.0+cu130`, FA4 `4.0.0b18`, CUTLASS DSL
 `4.6.2` with CUDA 13 libraries, Quack `0.6.4`, and TVM FFI `0.1.11`.
 Real-kernel tests require CUDA and CuTe FA4; their availability is checked at runtime.
 
-The focused suite passed all 97 tests without skips, including 11 CPU NPU/ROCm
-routing tests. NPU/ROCm device numerics and compilation remain unvalidated.
-Ruff lint and formatting pass. Upstream PyTorch/CUTLASS warnings remain.
+Before the rebase, the focused suite passed all 97 tests without skips, including
+11 CPU NPU/ROCm routing tests. After rebasing onto upstream `e3be42e05`, the
+expanded suite reports 99 passed and 11 failed in the local vLLM 0.28 environment.
+All 11 failures are import errors: upstream now requires `compute_layout_strides`
+from vLLM, which this environment lacks. Both noncontiguous FA4 regression cases
+and real-kernel schema/fake checks pass. The full suite must be rerun with the
+vLLM version required by upstream. NPU/ROCm device numerics and compilation remain
+unvalidated. Pre-commit passes with the CI hook skips. Upstream PyTorch/CUTLASS
+warnings remain.

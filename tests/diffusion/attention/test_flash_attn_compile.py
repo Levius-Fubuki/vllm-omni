@@ -98,10 +98,14 @@ def fake_fa4(monkeypatch, tmp_path):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_fa4_dense_dispatch_is_opaque_to_dynamic_torch_compile(fake_fa4):
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_fa4_dense_dispatch_is_opaque_to_dynamic_torch_compile(fake_fa4, noncontiguous):
     """Fast Dynamo/custom-op regression; Inductor coverage is separate."""
     impl = fake_fa4
     q = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous:
+        q = q.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not q.is_contiguous()
     path = impl.resolve_execution_path(
         ExecutionContext(
             platform="cuda",
@@ -132,7 +136,11 @@ def test_fa4_dense_dispatch_is_opaque_to_dynamic_torch_compile(fake_fa4):
     )
     out = compiled(q, q, q)
     q2 = torch.randn(1, 24, 8, 64, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous:
+        q2 = q2.transpose(1, 2).contiguous().transpose(1, 2)
     out2 = compiled(q2, q2, q2)
+    assert out.is_contiguous()
+    assert out2.is_contiguous()
 
     assert out.shape == q.shape
     assert out2.shape == q2.shape
@@ -284,12 +292,16 @@ def test_real_fa4_dimension_rejection_matches_kernel(monkeypatch, head_dims):
 
 
 @hardware_test(res={"cuda": "B200"}, num_cards=1)
-def test_real_fa4_custom_op_unequal_value_dimension_schema():
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_real_fa4_custom_op_unequal_value_dimension_schema(noncontiguous):
     if not current_omni_platform.is_cuda() or not fa.IS_FLASH_ATTN_4:
         pytest.skip("Requires CuTe FlashAttention-4")
     query = torch.randn(1, 17, 8, 80, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(1, 25, 8, 80, device="cuda", dtype=torch.bfloat16)
     value = torch.randn(1, 25, 8, 48, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous:
+        query, key, value = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (query, key, value))
+        assert not query.is_contiguous()
     torch.library.opcheck(
         torch.ops.vllm_omni.fa4_dense_attention.default,
         (query, key, value, 80**-0.5, False, False),
