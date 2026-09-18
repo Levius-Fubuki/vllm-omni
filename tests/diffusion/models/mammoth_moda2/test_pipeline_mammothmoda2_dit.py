@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -347,7 +346,7 @@ class _FakeScheduler:
         return (latents - model_pred,)
 
 
-def test_forward_returns_diffusion_output_with_request_sampling() -> None:
+def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
     pipeline = _pipeline_shell()
     pipeline.gen_transformer = _FakeTransformer()
     pipeline.gen_image_condition_refiner = None
@@ -362,17 +361,15 @@ def test_forward_returns_diffusion_output_with_request_sampling() -> None:
         return torch.zeros(shape, device=device, dtype=dtype)
 
     module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
-    with (
-        patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler),
-        patch(f"{module}.randn_tensor", side_effect=fake_randn_tensor),
-    ):
-        result = pipeline.forward(
-            _batch(
-                sampling=OmniDiffusionSamplingParams(
-                    height=32, width=48, seed=42, guidance_scale=1.0, num_inference_steps=2
-                )
+    mocker.patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler)
+    mocker.patch(f"{module}.randn_tensor", side_effect=fake_randn_tensor)
+    result = pipeline.forward(
+        _batch(
+            sampling=OmniDiffusionSamplingParams(
+                height=32, width=48, seed=42, guidance_scale=1.0, num_inference_steps=2
             )
         )
+    )
 
     assert isinstance(result, DiffusionOutput)
     assert result.output.shape == (1, 3, 32, 48)
