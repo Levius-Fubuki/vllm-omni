@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from benchmarks.diffusion.bench_mammoth_vae_patch_parallel import (
     error_metrics,
     json_safe,
     prepare_memory_measurement,
+    source_revision,
     tile_boundary_error_profile,
     tile_boundary_evidence,
     tile_rank_layout,
@@ -24,6 +26,15 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_source_revision_without_git_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing_git(*args, **kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
+
+    monkeypatch.setattr(subprocess, "check_output", missing_git)
+    monkeypatch.setenv("VLLM_OMNI_SOURCE_COMMIT", "test-commit")
+    assert source_revision() == ("test-commit", ["Git metadata unavailable"])
 
 
 def test_error_metrics_for_equal_outputs() -> None:

@@ -65,6 +65,20 @@ def json_safe(value):
     return value
 
 
+def source_revision() -> tuple[str, list[str]]:
+    """Record Git provenance when available, without requiring a Git checkout."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        changes = subprocess.check_output(
+            ["git", "status", "--short"], text=True, stderr=subprocess.DEVNULL
+        ).splitlines()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return os.environ.get("VLLM_OMNI_SOURCE_COMMIT", "unknown"), ["Git metadata unavailable"]
+    return commit, changes
+
+
 def center_stripe_error_profile(
     reference: torch.Tensor, actual: torch.Tensor, *, half_width: int = 32
 ) -> dict[str, float]:
@@ -350,9 +364,10 @@ def main() -> None:
             largest_error_index = torch.unravel_index(
                 (actual_cpu - tiled_reference_cpu).abs().argmax(), actual_cpu.shape
             )
+            commit, worktree_changes = source_revision()
             record = {
-                "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-                "worktree_changes": subprocess.check_output(["git", "status", "--short"], text=True).splitlines(),
+                "commit": commit,
+                "worktree_changes": worktree_changes,
                 "source_sha256": {
                     str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in (
