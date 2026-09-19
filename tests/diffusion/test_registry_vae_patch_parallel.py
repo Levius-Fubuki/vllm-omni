@@ -24,7 +24,7 @@ class _RecordingVae(nn.Module, DistributedVaeMixin):
         self.parallel_settings = (parallel_size, mode)
 
 
-def _initialize(mocker, *, attr: str, pp_size: int):
+def _initialize(mocker, *, attr: str, pp_size: int, use_tiling: bool = False):
     class _Pipeline(nn.Module):
         _vae_modules = [attr]
 
@@ -37,6 +37,7 @@ def _initialize(mocker, *, attr: str, pp_size: int):
     config = OmniDiffusionConfig(
         model_class_name="RecordingPipeline",
         parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=pp_size),
+        vae_use_tiling=use_tiling,
     )
     return registry.initialize_model(config), config
 
@@ -64,6 +65,13 @@ def test_declared_gen_vae_is_untouched_when_patch_parallel_disabled(mocker):
     assert config.vae_use_tiling is False
     assert pipeline.gen_vae.use_tiling is False
     assert pipeline.gen_vae.parallel_settings is None
+
+
+def test_declared_gen_vae_honors_explicit_tiling_with_one_rank(mocker):
+    pipeline, config = _initialize(mocker, attr="gen_vae", pp_size=1, use_tiling=True)
+
+    assert config.vae_use_tiling is True
+    assert pipeline.gen_vae.use_tiling is True
 
 
 def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):

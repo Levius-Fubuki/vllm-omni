@@ -68,9 +68,7 @@ def json_safe(value):
 def source_revision() -> tuple[str, list[str]]:
     """Record Git provenance when available, without requiring a Git checkout."""
     try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
         changes = subprocess.check_output(
             ["git", "status", "--short"], text=True, stderr=subprocess.DEVNULL
         ).splitlines()
@@ -250,7 +248,7 @@ def _run_mode(
                 if iteration == warmup:
                     first_output = result.detach().float().cpu()
     peak = torch.tensor(
-        [torch.accelerator.max_memory_allocated(), torch.cuda.max_memory_reserved()],
+        [torch.accelerator.max_memory_allocated(), torch.accelerator.max_memory_reserved()],
         dtype=torch.int64,
         device=latents.device,
     )
@@ -325,7 +323,7 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size != 2:
         raise ValueError(f"This comparison requires exactly two ranks, got {world_size}")
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     init_distributed_environment(world_size=world_size, rank=rank, local_rank=local_rank, backend="nccl")
     initialize_model_parallel(sequence_parallel_size=world_size, ulysses_degree=world_size, backend="nccl")
     try:

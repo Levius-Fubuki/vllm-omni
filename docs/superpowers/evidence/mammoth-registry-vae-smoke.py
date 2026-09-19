@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Two-rank Mammoth stage-construction and real VAE-weight decode smoke test."""
 
 import hashlib
@@ -27,7 +30,7 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 local_rank = int(os.environ["LOCAL_RANK"])
 assert world_size == 2
-torch.cuda.set_device(local_rank)
+torch.accelerator.set_device_index(local_rank)
 torch.manual_seed(2026)
 init_distributed_environment(world_size=world_size, rank=rank, local_rank=local_rank, backend="nccl")
 initialize_model_parallel(sequence_parallel_size=2, ulysses_degree=2, backend="nccl")

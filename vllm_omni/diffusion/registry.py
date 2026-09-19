@@ -444,8 +444,8 @@ def initialize_model(
         distributed_vae = getattr(model, "vae", None)
         if not isinstance(distributed_vae, DistributedVaeMixin):
             distributed_vae = None
-        if vae_pp_size > 1 and distributed_vae is None:
-            declared_vaes = []
+        if (vae_pp_size > 1 or od_config.vae_use_tiling) and distributed_vae is None:
+            declared_vaes: list[DistributedVaeMixin] = []
             for name in getattr(model, "_vae_modules", ()):
                 try:
                     component = attrgetter(name)(model)
@@ -479,7 +479,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if distributed_vae is not None:
-            distributed_vae.use_tiling = od_config.vae_use_tiling
+            setattr(distributed_vae, "use_tiling", od_config.vae_use_tiling)
             distributed_vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
         # Apply sequence parallelism if enabled
