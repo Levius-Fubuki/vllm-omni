@@ -4,7 +4,7 @@ Date: 2026-09-19. This includes real-weight VAE-only measurements, a two-rank st
 
 ## Source and hardware
 
-- Base: vLLM-Omni `4c7a98c26f6167a219b008263773c959a65ac0f2` (contains #7134), plus the `codex/mammoth-vae-pp` registry/Mammoth changes now committed as `129a4d7258040229442205a544bcce1b7e58df3d`. Older benchmark JSONs were captured before that commit and record the then-current modified-file SHA-256 values; the base commit alone does not identify the tested code.
+- Base: vLLM-Omni `4c7a98c26f6167a219b008263773c959a65ac0f2` (contains #7134), plus the `codex/mammoth-vae-pp` registry/Mammoth changes now committed as `c424f8aec` after a DCO sign-off rewrite (formerly `129a4d7258040229442205a544bcce1b7e58df3d`). The rewrite changed commit metadata, not source content. Older benchmark JSONs were captured before that commit and record the then-current modified-file SHA-256 values; the base commit alone does not identify the tested code.
 - VAE config and weights: `bytedance-research/MammothModa2-Preview`, config revision `ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`; all 244 `gen_vae.*` tensors were loaded from `model-00006-of-00008.safetensors` with a strict state-dict check. The AR and DiT weights were not loaded.
 - 2 × GeForce RTX 3090, 24 GiB, SM 8.6; driver 570.124.04. `nvidia-smi topo -m` reports `SYS` between the GPUs (cross-NUMA, no NVLink).
 - PyTorch 2.13.0+cu129, vLLM 0.29.0+cu129, Diffusers 0.40.0, Transformers 5.14.1. FP16 unless a row says otherwise.
@@ -61,7 +61,7 @@ Full-request PP=2 was attempted with AR TP=2 on GPUs 0+1 and DiT/VAE SP=2 on GPU
 
 ## Four-GPU complete-request validation
 
-The four-GPU host has 4 × RTX 3090 24 GiB, driver 570.124.04, PyTorch 2.13.0+cu129 and vLLM 0.29.0+cu129. GPUs 0+1 ran AR TP=2; GPU 2 ran PP=1 DiT/VAE, while GPUs 2+3 ran SP=2 DiT and PP=2 VAE. `nvidia-smi topo -m` reports `PXB` for the 2↔3 pair. Source commit `565dd993532bebfa89b5efd2f9a30d2b5a022d08`, pinned Preview weights, FP16, seed 42, prompt `A red fox in snow`, guidance 4, and VAE tiling were shared. Both PP=2 logs confirm tile splitting in both distributed DiT ranks. The focused suite passed 88 tests in this environment. These are single paired requests, not statistically significant benchmarks.
+The four-GPU host has 4 × RTX 3090 24 GiB, driver 570.124.04, PyTorch 2.13.0+cu129 and vLLM 0.29.0+cu129. GPUs 0+1 ran AR TP=2; GPU 2 ran PP=1 DiT/VAE, while GPUs 2+3 ran SP=2 DiT and PP=2 VAE. `nvidia-smi topo -m` reports `PXB` for the 2↔3 pair. The tested source commit was `565dd993532bebfa89b5efd2f9a30d2b5a022d08` (now `33324604e` after a sign-off-only history rewrite); source-file SHA-256 values in the raw JSON match the current tree. Pinned Preview weights, FP16, seed 42, prompt `A red fox in snow`, guidance 4, and VAE tiling were shared. Both PP=2 logs confirm tile splitting in both distributed DiT ranks. The focused suite passed 88 tests in this environment. These are single paired requests, not statistically significant benchmarks.
 
 | Request | PP=1 total / AR / stage 1 | PP=2 total / AR / stage 1 | Output comparison |
 | --- | ---: | ---: | --- |
