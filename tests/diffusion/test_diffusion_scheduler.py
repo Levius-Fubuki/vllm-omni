@@ -16,7 +16,7 @@ from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVContext, DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
     BaseScheduler,
@@ -502,6 +502,43 @@ class TestRequestScheduler:
         assert metadata is not None
         assert metadata.request_id == request.request_id
         assert len(metadata.sequences[0].block_ids[0]) == 4
+
+    def test_request_scoped_context_moves_through_scheduler_and_is_freed(self) -> None:
+        _initialize_paged_scheduler(self.scheduler)
+        request = _make_request("context")
+        context = DiffusionKVContext(
+            context_id="ar",
+            cache_role="ar_decode",
+            num_tokens=8,
+        )
+        request.diffusion_kv_requests = (
+            DiffusionKVRequest(
+                "context/diffusion-kv/0",
+                sequence_id=0,
+                prefix_len=4,
+                target_len=4,
+                seq_len=8,
+                kv_contexts=(context,),
+            ),
+        )
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(request)
+        scheduler_output = self.scheduler.schedule()
+
+        metadata = scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata
+        assert metadata is not None
+        assert metadata.sequences[0].context_ids == ("ar",)
+        assert [(item.context_id, item.cache_role) for item in metadata.contexts] == [("ar", "ar_decode")]
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
+
+        self.scheduler.update_from_output(
+            scheduler_output,
+            _make_request_output(request.request_id),
+        )
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)

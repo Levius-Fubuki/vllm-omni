@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
@@ -26,7 +27,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.vllm_config import _DiffusionVllmModelConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _LAYER_NAME = "model.layers.0.attn"
 _NUM_HEADS = 2
@@ -41,9 +42,10 @@ class _SmokeDiffusionAttention(nn.Module):
         self.num_kv_heads = _NUM_HEADS
         self.head_size = _HEAD_SIZE
         self.softmax_scale = _HEAD_SIZE**-0.5
+        self.paged_kv_cache_role = "primary"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> None:
     device = torch.device("cuda", torch.accelerator.current_device_index())
     vllm_config = VllmConfig(
