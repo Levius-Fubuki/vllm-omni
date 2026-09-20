@@ -5,6 +5,45 @@ and extends the [attention selection design](attention_backend_selection.md).
 It demonstrates path-specific capabilities with dense BF16 FA4, NPU/ROCm
 routing examples, and tensor-state lifetime with a test-only attention module.
 
+## SDPA follow-up migration
+
+The SDPA follow-up resolves CUDA dense noncausal FP16/BF16 calls after backend construction.
+It distinguishes equal Q/KV head counts (`sdpa_equal_heads`), a PyTorch
+fused-GQA probe accepting the original K/V head count (`sdpa_native_gqa`), and
+the existing K/V repeat-interleave fallback (`sdpa_expanded_kv`). The resolver
+and forward use the same probe on identically normalized masks and Q/K/V
+layouts. A successful probe identifies the SDPA-level route; it does not
+guarantee which fused kernel PyTorch chooses internally.
+
+Only no-mask calls and 2D boolean key-padding masks with published
+`attention_mask_mode="padding"` are marked supported. Packed, paged-KV,
+piecewise, quantized-KV, causal, parallel, HSDP, non-CUDA, and unpublished mask paths
+remain `UNMIGRATED`, so existing execution is not rejected. Pre-construction
+capabilities are also `UNMIGRATED`, because the runtime GQA decision needs
+actual tensors. Non-divisible Q/KV head ratios report `UNSUPPORTED` with the
+same actionable error as forward.
+
+All supported SDPA paths declare advisory `EAGER_ONLY`: on RTX 4090 with
+PyTorch 2.13.0+cu132, `torch.compile(fullgraph=True)` failed at the existing
+PyTorch `SDPAParams`/pybind GQA probe for native GQA, masked expanded K/V, and
+unmasked expanded K/V. No custom-op or compile-boundary change is included in
+this migration. A caller requesting guaranteed fullgraph receives an
+unsupported contract result; ordinary forward behavior remains unchanged.
+
+The CUDA regression matrix was run on an RTX 4090 (SM89, driver 580.76.05),
+Python 3.12.3, PyTorch 2.13.0+cu132, and vLLM 0.29.0. It compares eager SDPA
+output with explicitly expanded-K/V SDPA for BF16/FP16, equal-head and GQA
+inputs, batches 1/2, head dimensions 64/512, masked/unmasked calls, and
+square/non-square Q/K lengths. The focused SDPA plus capability suite passed 97 tests with two
+pre-existing PR #7379 layer-fixture failures deselected. Both baseline failures
+construct `Attention` without `skip_sequence_parallel` and are unrelated to
+SDPA resolution. These results validate contract routing and numerics on this
+environment, not a performance improvement or a cross-version compile claim.
+The new CUDA test file uses the repository's L4 resource marker for CI routing
+(also SM89) and explicitly skips when CUDA is unavailable; an unfiltered run
+with CUDA hidden skipped all 57 GPU cases. CPU-only CI checks conservative
+pre-construction and device mismatch but does not claim CUDA path coverage.
+
 ## Execution contract
 
 `ExecutionContext` describes the requested execution path. `ExecutionPathResult`
