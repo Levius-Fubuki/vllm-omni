@@ -170,11 +170,9 @@ def test_reserves_request_scoped_context_and_releases_it_with_the_request() -> N
     manager = _manager(8)
     free_before = manager.native_manager.block_pool.get_num_free_blocks()
     context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
+    requests = (_request("public", 0, kv_contexts=(context,)),)
 
-    metadata = manager.reserve_request(
-        "public",
-        (_request("public", 0, kv_contexts=(context,)),),
-    )
+    metadata = manager.reserve_request("public", requests)
 
     assert metadata is not None
     assert metadata.sequences[0].context_ids == ("text",)
@@ -183,9 +181,14 @@ def test_reserves_request_scoped_context_and_releases_it_with_the_request() -> N
     assert metadata.contexts[0].cache_role == "cross.text"
     assert metadata.contexts[0].num_tokens == 8
     assert len(metadata.contexts[0].block_ids[0]) == 2
+    assert manager._requests["public"] == requests
+    assert [request.request_id for request in manager._context_requests["public"]] == [
+        "public/diffusion-kv/context/text"
+    ]
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
 
     manager.free_request("public")
+    assert "public" not in manager._context_requests
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
@@ -70,7 +71,11 @@ class DiffusionKVCacheManager:
         # Native vLLM may reserve a null block, so an idle BlockPool does not
         # necessarily report ``kv_cache_config.num_blocks`` free blocks.
         self._empty_pool_num_free_blocks = self.native_manager.block_pool.get_num_free_blocks()
-        self._requests: dict[str, tuple[DiffusionKVRequest | _ContextKVRequest, ...]] = {}
+        # Keep sequence requests separate from context-only native shims.
+        # Sequence policies such as prefix publication and KV transfer must
+        # never interpret a context allocation as an execution sequence.
+        self._requests: dict[str, tuple[DiffusionKVRequest, ...]] = {}
+        self._context_requests: dict[str, tuple[_ContextKVRequest, ...]] = {}
         self._metadata: dict[str, DiffusionKVMetadata] = {}
         self._internal_request_ids: set[str] = set()
         self._next_allocation_generation = 1
@@ -238,7 +243,8 @@ class DiffusionKVCacheManager:
             contexts=tuple(context_metadata),
         )
         self._next_allocation_generation += 1
-        self._requests[public_request_id] = native_requests
+        self._requests[public_request_id] = requests
+        self._context_requests[public_request_id] = context_requests
         self._metadata[public_request_id] = metadata
         self._internal_request_ids.update(internal_ids)
         return metadata
@@ -251,7 +257,11 @@ class DiffusionKVCacheManager:
 
     def free_request(self, public_request_id: str) -> None:
         requests = self._requests.pop(public_request_id, ())
+        context_requests = self._context_requests.pop(public_request_id, ())
         self._metadata.pop(public_request_id, None)
+        for context_request in reversed(context_requests):
+            self.native_manager.free(context_request)
+            self._internal_request_ids.discard(context_request.request_id)
         for request in reversed(requests):
             self.native_manager.free(request)
             self._internal_request_ids.discard(request.request_id)
