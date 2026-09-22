@@ -13,8 +13,78 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
 
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
+
+_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS = 0
+
+
+def _apply_qk_norm_rope(
+    attn: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Mammoth's per-head Q/K norm and adjacent-pair real RoPE."""
+    batch_size, sequence_length, _, head_dim = query.shape
+    cos, sin = image_rotary_emb if image_rotary_emb is not None else (None, None)
+    use_fused = (
+        cos is not None
+        and sin is not None
+        and attn.norm_q is not None
+        and attn.norm_k is not None
+        and attn.norm_q.variance_epsilon == attn.norm_k.variance_epsilon
+        and key.shape[0] == batch_size
+        and key.shape[1] == sequence_length
+        and key.shape[-1] == head_dim
+        and _fused_cuda_supported(query, key, head_dim, head_dim, interleaved=True)
+        and cos.shape[-2:] == (sequence_length, head_dim)
+        and sin.shape == cos.shape
+        and cos.ndim in (2, 3)
+        and (cos.ndim == 2 or cos.shape[0] in (1, batch_size))
+        and cos.device == query.device
+        and cos.dtype in (query.dtype, torch.float32)
+        and sin.device == query.device
+        and sin.dtype == cos.dtype
+        and batch_size * sequence_length >= fused_qk_norm_rope_min_tokens(_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS)
+    )
+    if use_fused:
+        assert cos is not None and sin is not None
+        if cos.ndim == 2:
+            cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+        if cos.shape[0] == 1 and batch_size > 1:
+            cos = cos.expand(batch_size, -1, -1)
+            sin = sin.expand(batch_size, -1, -1)
+        rope_table = torch.cat((cos[..., 0::2], sin[..., 0::2]), dim=-1).reshape(batch_size * sequence_length, head_dim)
+        query, key = fused_qk_norm_rope(
+            query.reshape(batch_size * sequence_length, query.shape[2], head_dim),
+            key.reshape(batch_size * sequence_length, key.shape[2], head_dim),
+            attn.norm_q.weight,
+            attn.norm_k.weight,
+            rope_table,
+            attn.norm_q.variance_epsilon,
+            head_dim=head_dim,
+            rotary_dim=head_dim,
+            interleaved=True,
+        )
+        return (
+            query.reshape(batch_size, sequence_length, query.shape[1], head_dim),
+            key.reshape(batch_size, sequence_length, key.shape[1], head_dim),
+        )
+
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+    if image_rotary_emb is not None:
+        query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
+        key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
+    return query, key
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -281,7 +351,7 @@ class AttnProcessor:
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -307,14 +377,7 @@ class AttnProcessor:
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        if image_rotary_emb is not None:
-            query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
-            key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
+        query, key = _apply_qk_norm_rope(attn, query, key, image_rotary_emb)
 
         query, key = query.to(dtype), key.to(dtype)
 
@@ -403,7 +466,7 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        image_rotary_emb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         temb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:

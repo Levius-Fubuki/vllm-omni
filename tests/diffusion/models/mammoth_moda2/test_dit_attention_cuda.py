@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real-shape check of the MammothModa2 DiT attention on CUDA: the shared
-backend (FLASH_ATTN by default, head_dim 120) against the pre-change arithmetic
-in bf16, with the padding mask the joint text+image sequence carries."""
+"""Real-shape checks for MammothModa2's fused QK norm/RoPE and shared CUDA
+attention backend against the pre-change bf16 arithmetic."""
 
 import pytest
 import torch
 
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
+import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
@@ -24,6 +24,54 @@ pytestmark = [
 DIM, HEADS, KV_HEADS = 2520, 21, 7
 
 
+def _production_rotary(batch, seq, head_dim, dtype):
+    """Mammoth's real RoPE repeats one angle across each adjacent pair."""
+    angles = torch.rand(batch, seq, head_dim // 2, device="cuda") * 6.283
+    return (
+        angles.cos().repeat_interleave(2, dim=-1).to(dtype),
+        angles.sin().repeat_interleave(2, dim=-1).to(dtype),
+    )
+
+
+def test_production_rope_uses_fused_qk_norm_rope(monkeypatch):
+    torch.manual_seed(0)
+    seq = 512
+    block = (
+        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
+        .cuda()
+        .to(torch.bfloat16)
+        .eval()
+    )
+    hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
+    mask[0, -37:] = False
+    rotary = _production_rotary(1, seq, block.head_dim, torch.bfloat16)
+    calls = []
+    fused_qk_norm_rope = mammoth_dit.fused_qk_norm_rope
+
+    def record_fused(q, k, q_weight, k_weight, rope_table, eps, **kwargs):
+        calls.append((q.shape, k.shape, rope_table.shape, kwargs))
+        return fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps, **kwargs)
+
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", record_fused)
+    with torch.no_grad():
+        got = block.attn(hidden, hidden, attention_mask=mask, image_rotary_emb=rotary)
+        want = _reference_attention(block.attn, hidden, mask, rotary)
+
+    assert calls == [
+        (
+            torch.Size((2 * seq, HEADS, block.head_dim)),
+            torch.Size((2 * seq, KV_HEADS, block.head_dim)),
+            torch.Size((2 * seq, block.head_dim)),
+            {"head_dim": block.head_dim, "rotary_dim": block.head_dim, "interleaved": True},
+        )
+    ]
+    diff = (got.float() - want.float()).abs()[mask]
+    assert diff.max().item() < 2e-2, diff.max().item()
+    assert diff.mean().item() < 1e-3, diff.mean().item()
+
+
 @pytest.mark.parametrize("seq", [77 + 4096, 512], ids=["t2i_1024", "short"])
 def test_real_shape_matches_previous_arithmetic_bf16(seq):
     torch.manual_seed(0)
@@ -37,8 +85,7 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, seq - 300 :] = False
     mask[1, seq - 17 :] = False
-    angles = torch.rand(1, seq, block.head_dim, device="cuda") * 6.283
-    rotary = (angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16))
+    rotary = _production_rotary(1, seq, block.head_dim, torch.bfloat16)
     with torch.no_grad():
         got = block.attn(
             hidden_states=hidden, encoder_hidden_states=hidden, attention_mask=mask, image_rotary_emb=rotary
@@ -124,7 +171,11 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
         calls.append((query.shape, key.shape, value.shape, query.dtype, kwargs))
         return sdpa(query, key, value, **kwargs)
 
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("FP32 must keep Mammoth's native QK norm/RoPE path")
+
     with torch.no_grad(), monkeypatch.context() as patch:
+        patch.setattr(mammoth_dit, "fused_qk_norm_rope", reject_fused)
         patch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", check_gqa)
         patch.setattr(torch.nn.functional, "scaled_dot_product_attention", record_sdpa)
         patch.setattr(strategy, "pre_attention", prepare)
