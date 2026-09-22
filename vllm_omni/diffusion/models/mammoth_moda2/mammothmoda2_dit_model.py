@@ -29,12 +29,15 @@ def _apply_qk_norm_rope(
     query: torch.Tensor,
     key: torch.Tensor,
     image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    rope_repeats_pairs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply Mammoth's per-head Q/K norm and adjacent-pair real RoPE."""
     batch_size, sequence_length, _, head_dim = query.shape
     cos, sin = image_rotary_emb if image_rotary_emb is not None else (None, None)
     use_fused = (
-        cos is not None
+        rope_repeats_pairs
+        and cos is not None
         and sin is not None
         and attn.norm_q is not None
         and attn.norm_k is not None
@@ -345,6 +348,11 @@ class AttnProcessor:
     head count first.
     """
 
+    def __init__(self, *, rope_repeats_pairs: bool = False) -> None:
+        # Only the model's RotaryPosEmbedReal producer guarantees equal adjacent
+        # lanes. Generic processors retain the native four-lane arithmetic.
+        self.rope_repeats_pairs = rope_repeats_pairs
+
     def __call__(
         self,
         attn: Attention,
@@ -377,7 +385,7 @@ class AttnProcessor:
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        query, key = _apply_qk_norm_rope(attn, query, key, image_rotary_emb)
+        query, key = _apply_qk_norm_rope(attn, query, key, image_rotary_emb, rope_repeats_pairs=self.rope_repeats_pairs)
 
         query, key = query.to(dtype), key.to(dtype)
 
@@ -410,13 +418,15 @@ class TransformerBlock(nn.Module):
         ffn_dim_multiplier: float,
         norm_eps: float,
         modulation: bool = True,
+        *,
+        rope_repeats_pairs: bool = False,
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
         self.head_dim = dim // num_attention_heads
         self.modulation = modulation
 
-        processor = AttnProcessor()
+        processor = AttnProcessor(rope_repeats_pairs=rope_repeats_pairs)
 
         # Initialize attention layer
         self.attn = Attention(
@@ -568,6 +578,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -583,6 +594,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -598,6 +610,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=False,
+                    rope_repeats_pairs=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -614,6 +627,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    rope_repeats_pairs=True,
                 )
                 for _ in range(num_layers)
             ]

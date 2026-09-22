@@ -5,6 +5,8 @@ attention backend against the pre-change bf16 arithmetic."""
 
 import pytest
 import torch
+from diffusers.models.attention_processor import Attention
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
@@ -24,6 +26,49 @@ pytestmark = [
 DIM, HEADS, KV_HEADS = 2520, 21, 7
 
 
+def _norm_attention(head_dim, dtype):
+    attn = Attention(query_dim=head_dim * HEADS, heads=HEADS, kv_heads=KV_HEADS, dim_head=head_dim)
+    attn.norm_q = Qwen2RMSNorm(head_dim)
+    attn.norm_k = Qwen2RMSNorm(head_dim)
+    return attn.to(device="cuda", dtype=dtype)
+
+
+def test_unpaired_rope_preserves_native_arithmetic(monkeypatch):
+    """A generic block accepts independently valued even and odd RoPE lanes."""
+    torch.manual_seed(42)
+    q = torch.randn(2, 17, HEADS, 120, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 17, KV_HEADS, 120, device="cuda", dtype=torch.bfloat16)
+    attn = _norm_attention(120, torch.bfloat16)
+    angles = torch.rand(2, 17, 120, device="cuda") * 6.283
+    rotary = angles.cos().to(q.dtype), angles.sin().to(q.dtype)
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    with torch.no_grad():
+        got = mammoth_dit._apply_qk_norm_rope(attn, q, k, rotary)
+        expected = (
+            mammoth_dit.apply_real_rotary_emb(attn.norm_q(q), *rotary),
+            mammoth_dit.apply_real_rotary_emb(attn.norm_k(k), *rotary),
+        )
+    for actual, want in zip(got, expected):
+        torch.testing.assert_close(actual, want, atol=0, rtol=0)
+
+
+def test_qk_norm_rope_benchmark_measures_inference(monkeypatch):
+    from benchmarks.diffusion import benchmark_mammoth_moda2_qk_norm_rope as benchmark
+
+    calls = []
+
+    def measure(fn, warmup, iters):
+        outputs = fn()
+        assert not torch.is_grad_enabled()
+        assert all(not output.requires_grad for output in outputs)
+        calls.append(fn.__name__)
+        return {"median_ms": 1.0}
+
+    monkeypatch.setattr(benchmark, "_measure", measure)
+    benchmark._run_shape(17, warmup=0, iters=1)
+    assert calls == ["native", "fused"]
+
+
 def _production_rotary(batch, seq, head_dim, dtype):
     """Mammoth's real RoPE repeats one angle across each adjacent pair."""
     angles = torch.rand(batch, seq, head_dim // 2, device="cuda") * 6.283
@@ -37,7 +82,15 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch):
     torch.manual_seed(0)
     seq = 512
     block = (
-        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
+        TransformerBlock(
+            DIM,
+            HEADS,
+            KV_HEADS,
+            multiple_of=256,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            rope_repeats_pairs=True,
+        )
         .cuda()
         .to(torch.bfloat16)
         .eval()
@@ -76,7 +129,15 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch):
 def test_real_shape_matches_previous_arithmetic_bf16(seq):
     torch.manual_seed(0)
     block = (
-        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
+        TransformerBlock(
+            DIM,
+            HEADS,
+            KV_HEADS,
+            multiple_of=256,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            rope_repeats_pairs=True,
+        )
         .cuda()
         .to(torch.bfloat16)
         .eval()
@@ -137,7 +198,15 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
     torch.manual_seed(0)
     dt = torch.float32
     block = (
-        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
+        TransformerBlock(
+            DIM,
+            HEADS,
+            KV_HEADS,
+            multiple_of=256,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            rope_repeats_pairs=True,
+        )
         .cuda()
         .to(dt)
         .eval()
@@ -200,3 +269,87 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
     assert torch.count_nonzero(got[~mask]) == 0
     diff = (got.float() - want.float()).abs()[mask]
     assert diff.max().item() < 1e-3, diff.max().item()
+
+
+@pytest.mark.parametrize("layout", ["unbatched", "broadcast", "per_example", "strided"])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_paired_rope_with_learned_norm_weights(monkeypatch, layout, table_dtype):
+    torch.manual_seed(42)
+    batch, seq, head_dim = 2, 19, 120
+    attn = _norm_attention(head_dim, torch.bfloat16)
+    with torch.no_grad():
+        attn.norm_q.weight.normal_(1.0, 0.2)
+        attn.norm_k.weight.normal_(1.0, 0.2)
+    # Mimic views into packed QKV projections, including their nontrivial stride.
+    packed = torch.randn(batch, seq, HEADS + 2 * KV_HEADS, head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, _ = packed.split((HEADS, KV_HEADS, KV_HEADS), dim=2)
+    rotary = _production_rotary(batch if layout in ("per_example", "strided") else 1, seq, head_dim, table_dtype)
+    if layout == "unbatched":
+        rotary = tuple(t.squeeze(0) for t in rotary)
+    elif layout == "strided":
+        rotary = tuple(t.transpose(0, 1).contiguous().transpose(0, 1) for t in rotary)
+        assert not rotary[0].is_contiguous()
+    calls = []
+    fused = mammoth_dit.fused_qk_norm_rope
+
+    def record(*args, **kwargs):
+        calls.append(args[4].shape)
+        return fused(*args, **kwargs)
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", record)
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    with torch.no_grad():
+        got = mammoth_dit._apply_qk_norm_rope(attn, q, k, rotary, rope_repeats_pairs=True)
+        expected = (
+            mammoth_dit.apply_real_rotary_emb(attn.norm_q(q), *rotary),
+            mammoth_dit.apply_real_rotary_emb(attn.norm_k(k), *rotary),
+        )
+    assert calls == [torch.Size((batch * seq, head_dim))]
+    for actual, want in zip(got, expected):
+        torch.testing.assert_close(actual, want.to(actual.dtype), atol=0.0625, rtol=0.02)
+
+
+@pytest.mark.parametrize(
+    "reason", ["support_query", "token_gate", "no_q_norm", "no_k_norm", "epsilon", "fp16", "head_dim", "no_rope"]
+)
+def test_qk_norm_rope_unsupported_inputs_keep_native_chain(monkeypatch, reason):
+    torch.manual_seed(42)
+    dtype = torch.float16 if reason == "fp16" else torch.bfloat16
+    dim = 260 if reason == "head_dim" else 120
+    attn = _norm_attention(dim, dtype)
+    q = torch.randn(2, 19, HEADS, dim, device="cuda", dtype=dtype)
+    k = torch.randn(2, 19, KV_HEADS, dim, device="cuda", dtype=dtype)
+    rotary = _production_rotary(2, 19, dim, dtype) if reason != "no_rope" else None
+    if reason == "support_query":
+        monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
+    elif reason == "no_q_norm":
+        attn.norm_q = None
+    elif reason == "no_k_norm":
+        attn.norm_k = None
+    elif reason == "epsilon":
+        attn.norm_k.variance_epsilon = 1e-3
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "39" if reason == "token_gate" else "0")
+
+    def reject(*args, **kwargs):
+        raise AssertionError(f"Unsupported {reason} must keep the native chain")
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", reject)
+    with torch.no_grad():
+        got = mammoth_dit._apply_qk_norm_rope(attn, q, k, rotary, rope_repeats_pairs=True)
+        expected_q = attn.norm_q(q) if attn.norm_q is not None else q
+        expected_k = attn.norm_k(k) if attn.norm_k is not None else k
+        if rotary is not None:
+            expected_q = mammoth_dit.apply_real_rotary_emb(expected_q, *rotary)
+            expected_k = mammoth_dit.apply_real_rotary_emb(expected_k, *rotary)
+    torch.testing.assert_close(got[0], expected_q, atol=0, rtol=0)
+    torch.testing.assert_close(got[1], expected_k, atol=0, rtol=0)
+
+
+def test_attention_benchmark_single_token_and_restores_gate(monkeypatch):
+    from benchmarks.diffusion import benchmark_mammoth_moda2_qk_norm_rope as benchmark
+
+    env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
+    monkeypatch.setenv(env, "123")
+    result = benchmark._run_attention(1, warmup=0, iters=1)
+    assert result["sequence"] == 1
+    assert benchmark.os.environ[env] == "123"
