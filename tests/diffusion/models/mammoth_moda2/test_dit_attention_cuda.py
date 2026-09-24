@@ -78,7 +78,8 @@ def _production_rotary(batch, seq, head_dim, dtype):
     )
 
 
-def test_production_rope_uses_fused_qk_norm_rope(monkeypatch):
+@pytest.mark.parametrize("force_native", [False, True])
+def test_production_rope_uses_fused_qk_norm_rope(monkeypatch, force_native):
     torch.manual_seed(0)
     seq = 512
     block = (
@@ -107,19 +108,27 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch):
         return fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps, **kwargs)
 
     monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    if force_native:
+        monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
     monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", record_fused)
     with torch.no_grad():
         got = block.attn(hidden, hidden, attention_mask=mask, image_rotary_emb=rotary)
         want = _reference_attention(block.attn, hidden, mask, rotary)
 
-    assert calls == [
-        (
-            torch.Size((2 * seq, HEADS, block.head_dim)),
-            torch.Size((2 * seq, KV_HEADS, block.head_dim)),
-            torch.Size((2 * seq, block.head_dim)),
-            {"head_dim": block.head_dim, "rotary_dim": block.head_dim, "interleaved": True},
-        )
-    ]
+    supported = mammoth_dit._fused_cuda_supported(hidden, hidden, block.head_dim, block.head_dim, interleaved=True)
+    expected_calls = (
+        [
+            (
+                torch.Size((2 * seq, HEADS, block.head_dim)),
+                torch.Size((2 * seq, KV_HEADS, block.head_dim)),
+                torch.Size((2 * seq, block.head_dim)),
+                {"head_dim": block.head_dim, "rotary_dim": block.head_dim, "interleaved": True},
+            )
+        ]
+        if supported
+        else []
+    )
+    assert calls == expected_calls
     diff = (got.float() - want.float()).abs()[mask]
     assert diff.max().item() < 2e-2, diff.max().item()
     assert diff.mean().item() < 1e-3, diff.mean().item()
@@ -273,7 +282,8 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
 
 @pytest.mark.parametrize("layout", ["unbatched", "broadcast", "per_example", "strided"])
 @pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
-def test_paired_rope_with_learned_norm_weights(monkeypatch, layout, table_dtype):
+@pytest.mark.parametrize("force_native", [False, True])
+def test_paired_rope_with_learned_norm_weights(monkeypatch, layout, table_dtype, force_native):
     torch.manual_seed(42)
     batch, seq, head_dim = 2, 19, 120
     attn = _norm_attention(head_dim, torch.bfloat16)
@@ -297,6 +307,8 @@ def test_paired_rope_with_learned_norm_weights(monkeypatch, layout, table_dtype)
         return fused(*args, **kwargs)
 
     monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", record)
+    if force_native:
+        monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
     monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     with torch.no_grad():
         got = mammoth_dit._apply_qk_norm_rope(attn, q, k, rotary, rope_repeats_pairs=True)
@@ -304,7 +316,8 @@ def test_paired_rope_with_learned_norm_weights(monkeypatch, layout, table_dtype)
             mammoth_dit.apply_real_rotary_emb(attn.norm_q(q), *rotary),
             mammoth_dit.apply_real_rotary_emb(attn.norm_k(k), *rotary),
         )
-    assert calls == [torch.Size((batch * seq, head_dim))]
+    supported = mammoth_dit._fused_cuda_supported(q, k, head_dim, head_dim, interleaved=True)
+    assert calls == ([torch.Size((batch * seq, head_dim))] if supported else [])
     for actual, want in zip(got, expected):
         torch.testing.assert_close(actual, want.to(actual.dtype), atol=0.0625, rtol=0.02)
 
@@ -353,3 +366,98 @@ def test_attention_benchmark_single_token_and_restores_gate(monkeypatch):
     result = benchmark._run_attention(1, warmup=0, iters=1)
     assert result["sequence"] == 1
     assert benchmark.os.environ[env] == "123"
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["gated_native", "reused_packed"])
+def test_prepared_rope_table_skips_per_layer_gate_and_packing(monkeypatch, packed):
+    torch.manual_seed(7)
+    batch, seq, dim = 2, 19, 120
+    attn = _norm_attention(dim, torch.bfloat16)
+    q = torch.randn(batch, seq, HEADS, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, KV_HEADS, dim, device="cuda", dtype=torch.bfloat16)
+    cos, sin = _production_rotary(batch, seq, dim, torch.float32)
+    table = torch.cat((cos[..., 0::2], sin[..., 0::2]), dim=-1).reshape(batch * seq, dim) if packed else None
+    rotary = cos, sin, table
+    calls = []
+    fused = mammoth_dit.fused_qk_norm_rope
+
+    def record(*args, **kwargs):
+        calls.append(args[4])
+        return fused(*args, **kwargs)
+
+    def forbid_gate(*args, **kwargs):
+        raise AssertionError("Prepared RoPE must not resolve the token gate per attention layer")
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope", record)
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope_min_tokens", forbid_gate)
+    with torch.no_grad():
+        for _ in range(2):
+            got = mammoth_dit._apply_qk_norm_rope(attn, q, k, rotary, rope_repeats_pairs=True)
+            expected = (
+                mammoth_dit.apply_real_rotary_emb(attn.norm_q(q), cos, sin),
+                mammoth_dit.apply_real_rotary_emb(attn.norm_k(k), cos, sin),
+            )
+            for actual, want in zip(got, expected):
+                torch.testing.assert_close(
+                    actual, want.to(actual.dtype), atol=0.0625 if packed else 0, rtol=0.02 if packed else 0
+                )
+    supported = packed and mammoth_dit._fused_cuda_supported(q, k, dim, dim, interleaved=True)
+    assert calls == ([table, table] if supported else [])
+
+
+def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch):
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+    from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    torch.manual_seed(7)
+    model = (
+        Transformer2DModel(
+            patch_size=2,
+            in_channels=4,
+            hidden_size=48,
+            num_layers=1,
+            num_refiner_layers=1,
+            num_attention_heads=6,
+            num_kv_heads=2,
+            multiple_of=8,
+            ffn_dim_multiplier=1.0,
+            axes_dim_rope=(2, 2, 4),
+            axes_lens=(8, 8, 8),
+            text_feat_dim=32,
+        )
+        .cuda()
+        .to(torch.bfloat16)
+        .eval()
+    )
+    hidden = torch.randn(2, 4, 4, 4, device="cuda", dtype=torch.bfloat16)
+    text = torch.randn(2, 4, 32, device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(2, 4, device="cuda", dtype=torch.bool)
+    freqs = RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (8, 8, 8), 10000)
+    calls = []
+
+    def threshold(default):
+        calls.append(default)
+        return 9
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope_min_tokens", threshold)
+    with torch.no_grad():
+        prepared = model._prepare_embeddings(hidden, torch.ones(2, device="cuda"), text, mask, freqs, 2, 4, 4)
+    context, noise, joint = prepared[6:9]
+    assert calls == [0]
+    assert all(len(rotary) == 3 for rotary in (context, noise, joint))
+    assert context[2] is None and noise[2] is None
+    assert joint[2].shape == (2 * 8, 8)
+    for rotary in (context, noise, joint):
+        if rotary[2] is not None:
+            expected = torch.cat((rotary[0][..., 0::2], rotary[1][..., 0::2]), dim=-1).reshape(-1, 8).float()
+            torch.testing.assert_close(rotary[2], expected, atol=0, rtol=0)
+
+    # Exercise the prepared tuple through every real refiner and joint block,
+    # then compare the same model forward with the unsupported-device fallback.
+    args = (hidden, torch.ones(2, device="cuda"), text, freqs, mask)
+    with torch.no_grad():
+        fused_output = model(*args)
+        monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
+        native_output = model(*args)
+    assert fused_output.shape == hidden.shape
+    torch.testing.assert_close(fused_output, native_output, atol=0.0625, rtol=0.02)
