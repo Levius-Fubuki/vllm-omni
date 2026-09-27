@@ -3,14 +3,23 @@
 
 """VAE patch-parallel selection in the diffusion model registry."""
 
+from typing import ClassVar
+
 import pytest
 from torch import nn
 
 from vllm_omni.diffusion import registry
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _DeclaredPipeline(nn.Module, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = []
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = []
 
 
 class _RecordingVae(nn.Module, DistributedVaeMixin):
@@ -25,7 +34,7 @@ class _RecordingVae(nn.Module, DistributedVaeMixin):
 
 
 def _initialize(mocker, *, attr: str, pp_size: int, use_tiling: bool = False):
-    class _Pipeline(nn.Module):
+    class _Pipeline(_DeclaredPipeline):
         _vae_modules = [attr]
 
         def __init__(self, *, od_config):
@@ -74,8 +83,34 @@ def test_declared_gen_vae_honors_explicit_tiling_with_one_rank(mocker):
     assert pipeline.gen_vae.use_tiling is True
 
 
-def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_plain_vae_warns_only_for_unsupported_parallelism(mocker, pp_size):
     class _Pipeline(nn.Module):
+        def __init__(self, *, od_config):
+            super().__init__()
+            self.vae = nn.Module()
+            self.vae.use_tiling = False
+
+    mocker.patch.object(registry.DiffusionModelRegistry, "_try_load_model_cls", return_value=_Pipeline)
+    mocker.patch.object(registry, "_apply_sequence_parallel_if_enabled")
+    warning = mocker.patch.object(registry.logger, "warning")
+    config = OmniDiffusionConfig(
+        model_class_name="PlainVaePipeline",
+        vae_use_tiling=True,
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=pp_size),
+    )
+
+    pipeline = registry.initialize_model(config)
+
+    assert pipeline.vae.use_tiling is True
+    if pp_size == 1:
+        warning.assert_not_called()
+    else:
+        warning.assert_called_once()
+
+
+def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):
+    class _Pipeline(_DeclaredPipeline):
         _vae_modules = ["gen_vae", "preview_vae"]
 
         def __init__(self, *, od_config):
@@ -98,7 +133,7 @@ def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):
 
 
 def test_duplicate_declared_path_to_same_vae_is_configured_once(mocker):
-    class _Pipeline(nn.Module):
+    class _Pipeline(_DeclaredPipeline):
         _vae_modules = ["gen_vae", "wrapper.gen_vae"]
 
         def __init__(self, *, od_config):
