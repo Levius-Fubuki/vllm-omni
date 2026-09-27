@@ -768,19 +768,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             device,
         )
 
-        # The producer repeats each frequency across adjacent lanes. Resolve
-        # support and the token gate once, then share each of the three packed
-        # tables across its refiner or transformer layers.
-        head_dim = rotary_emb[0].shape[-1]
-        min_tokens = (
-            fused_qk_norm_rope_min_tokens(_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS)
-            if _fused_cuda_supported(hidden_states, hidden_states, head_dim, head_dim, interleaved=True)
-            else None
-        )
-        context_rotary_emb = _with_packed_rope_table(context_rotary_emb, min_tokens)
-        noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb, min_tokens)
-        rotary_emb = _with_packed_rope_table(rotary_emb, min_tokens)
-
         return (
             temb,
             text_hidden_states,
@@ -866,6 +853,20 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             ar_image_hidden_states,
             ar_image_attention_mask,
         )
+
+        # The producer repeats each frequency across adjacent lanes. Resolve
+        # support and the token gate once, then share each of the three packed
+        # tables across its refiner or transformer layers. Keep preparation in
+        # forward so embedding-only callers retain the producer's return values.
+        head_dim = rotary_emb[0].shape[-1]
+        min_tokens = (
+            fused_qk_norm_rope_min_tokens(_MAMMOTH_FUSED_QK_NORM_ROPE_MIN_TOKENS)
+            if _fused_cuda_supported(hidden_states, hidden_states, head_dim, head_dim, interleaved=True)
+            else None
+        )
+        context_rotary_emb = _with_packed_rope_table(context_rotary_emb, min_tokens)
+        noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb, min_tokens)
+        rotary_emb = _with_packed_rope_table(rotary_emb, min_tokens)
 
         text_hidden_states, img_tokens = self._apply_refiners(
             text_hidden_states,

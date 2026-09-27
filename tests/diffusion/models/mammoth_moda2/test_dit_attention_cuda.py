@@ -405,7 +405,8 @@ def test_prepared_rope_table_skips_per_layer_gate_and_packing(monkeypatch, packe
     assert calls == ([table, table] if supported else [])
 
 
-def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch):
+@pytest.mark.parametrize("force_native", [False, True])
+def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch, force_native):
     from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
     from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
@@ -439,14 +440,35 @@ def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch)
         calls.append(default)
         return 9
 
+    if force_native:
+        monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
+    supported = mammoth_dit._fused_cuda_supported(hidden, hidden, 8, 8, interleaved=True)
+    tables: list[mammoth_dit.RotaryEmbedding] = []
+    refiners = model._apply_refiners
+    layers = model._apply_transformer_layers
+
+    def record_refiners(text, text_mask, context, img, img_mask, noise, temb):
+        tables.extend((context, noise))
+        return refiners(text, text_mask, context, img, img_mask, noise, temb)
+
+    def record_layers(hidden, mask, joint, temb):
+        tables.append(joint)
+        return layers(hidden, mask, joint, temb)
+
+    monkeypatch.setattr(model, "_apply_refiners", record_refiners)
+    monkeypatch.setattr(model, "_apply_transformer_layers", record_layers)
     monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope_min_tokens", threshold)
+    args = (hidden, torch.ones(2, device="cuda"), text, freqs, mask)
     with torch.no_grad():
-        prepared = model._prepare_embeddings(hidden, torch.ones(2, device="cuda"), text, mask, freqs, 2, 4, 4)
-    context, noise, joint = prepared[6:9]
-    assert calls == [0]
+        fused_output = model(*args)
+    context, noise, joint = tables
+    assert calls == ([0] if supported else [])
     assert all(len(rotary) == 3 for rotary in (context, noise, joint))
     assert context[2] is None and noise[2] is None
-    assert joint[2].shape == (2 * 8, 8)
+    if supported:
+        assert joint[2].shape == (2 * 8, 8)
+    else:
+        assert joint[2] is None
     for rotary in (context, noise, joint):
         if rotary[2] is not None:
             expected = torch.cat((rotary[0][..., 0::2], rotary[1][..., 0::2]), dim=-1).reshape(-1, 8).float()
@@ -454,9 +476,7 @@ def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch)
 
     # Exercise the prepared tuple through every real refiner and joint block,
     # then compare the same model forward with the unsupported-device fallback.
-    args = (hidden, torch.ones(2, device="cuda"), text, freqs, mask)
     with torch.no_grad():
-        fused_output = model(*args)
         monkeypatch.setattr(mammoth_dit, "_fused_cuda_supported", lambda *args, **kwargs: False)
         native_output = model(*args)
     assert fused_output.shape == hidden.shape
