@@ -38,6 +38,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
+from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     BatchSpeechRequest,
@@ -1095,22 +1096,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "embedding_dim": emb_dim,
         }
 
-    async def delete_voice(self, name: str) -> bool:
+    async def delete_voice(self, name: str):
         """
         Delete an uploaded voice.
 
         Args:
             name: Voice name to delete
-
-        Returns:
-            bool: True if successful, False if voice doesn't exist
         """
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            built_in_speakers = self._get_available_voices() - set(self.uploaded_speakers)
+
+            if voice_name_lower in built_in_speakers:
+                err = f"Cannot delete built-in voice '{name}'"
+                raise InvalidPresetVoiceReferenceError(err)
 
             if voice_name_lower not in self.uploaded_speakers:
-                logger.warning("Voice '%s' not found", name)
-                return False
+                err = f"Voice '{name}' not found"
+                raise InvalidVoiceReferenceError(err)
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
@@ -1125,7 +1128,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._speaker_cache.clear(voice_name_lower)
 
         logger.info("Deleted voice '%s'", name)
-        return True
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -1807,6 +1809,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+            # Disconnects can arrive while suspended at yield. Closing the
+            # engine iterator must survive the cancelled ASGI scope.
             close = getattr(generator, "aclose", None)
             if close is not None:
                 with anyio.CancelScope(shield=True):
@@ -2724,8 +2728,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 e,
             )
-            logger.exception("Speech generation failed: %s", e)
-            return self.create_error_response(f"Speech generation failed: {e}")
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     @staticmethod
     def _merge_batch_item(
