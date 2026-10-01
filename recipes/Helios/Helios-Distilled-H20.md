@@ -85,9 +85,19 @@ budget estimate, not a measured minimum RAM or GPU requirement.
 Start from the [source installation guide](../../docs/getting_started/installation/README.md)
 and use the versions above to reproduce this environment. The FlashAttention
 package is the FA3 forward wheel, not an interchangeable FA2 build. The
-benchmark records the selected attention implementation from the worker.
+benchmark records the selected attention implementation from the worker. New
+runs also record the resolved `flash_attn_func` and `flash_attn_varlen_func`
+module/qualified names under `attention_implementations.flash_attention_bindings`.
+The September 27 artifact predates this field: it records wrapper counts and
+installed package versions, but does not independently establish the bound
+provider. Its historical metadata and script hashes are preserved.
 
 ## Reproduce the comparison
+
+This is a Helios-specific offline harness for the fixed A2 workload. Follow-up
+Helios comparisons can reuse it with the same measurement contract. Its location
+does not settle RFC #8173's shared-harness question: serving, TTFF and concurrency
+measurements still require a separately agreed common interface.
 
 Run from the repository root, using a fresh process for each backend:
 
@@ -199,6 +209,28 @@ matrices or differing workload/environment metadata. These metrics quantify
 numerical alignment; they do not establish perceptual quality on a broad video
 benchmark.
 
+### Export the compact result artifact
+
+The checked-in JSON is a summary: it contains each measured request's aggregate
+wall/transformer timings, forward count, memory and output hash, plus alignment
+metrics. Full `transformer_timings` and `stage_durations_ms` remain in the raw
+per-backend `results.json` files; they are not included in the committed summary.
+The following exports that summary from the raw matrix:
+
+```bash
+python -m benchmarks.diffusion.export_helios_attention helios-attention \
+  --provenance run-provenance.json \
+  --output helios-attention-summary.json
+```
+
+The provenance JSON must supply `date`, `runtime_commit`,
+`benchmark_script_sha256`, `comparison_script_sha256`, `model`, `model_revision`,
+`checkpoint_verification` and `scope` for the measured run. For re-exporting the
+original September 27 raw matrix only, use the checked-in
+`recipes/Helios/Helios-Distilled-H20-results.json` as `--provenance`. A new run
+must supply its own provenance; the exporter never hashes today's scripts and
+attributes them to a historical run.
+
 ### Observed alignment
 
 All 12 repeated outputs within **each** backend were byte-identical to that
@@ -218,6 +250,11 @@ tradeoff, not a broad quality acceptance threshold or a reason to change the
 global default. Exact repetitions here describe this single-session setup.
 
 ## Backend choice and a validated command
+
+The reported speedups use explicitly selected `TORCH_SDPA` as the baseline.
+On H20, automatic selection already prefers `FLASH_ATTN` when a supported
+FlashAttention implementation imports successfully. These numbers are therefore
+not an improvement over the existing automatic default.
 
 For latency-oriented use of this H20 configuration, `FLASH_ATTN` with the
 specified FA3 package and `CUDNN_ATTN` are both viable options, with effectively

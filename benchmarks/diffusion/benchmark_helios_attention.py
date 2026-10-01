@@ -24,6 +24,16 @@ PROMPTS = [
 ]
 
 
+def describe_flash_bindings(provider) -> dict:
+    """Record resolved callables, not just the attention wrapper or wheel version."""
+    return {
+        name: None
+        if (func := getattr(provider, name)) is None
+        else {"module": func.__module__, "qualname": func.__qualname__}
+        for name in ("flash_attn_func", "flash_attn_varlen_func")
+    }
+
+
 class HeliosBenchmarkWorker:
     """Worker extension that measures transformer forwards on the device stream."""
 
@@ -60,6 +70,10 @@ class HeliosBenchmarkWorker:
             if isinstance(module, Attention):
                 name = f"{type(module.attention).__module__}.{type(module.attention).__qualname__}"
                 implementations[name] = implementations.get(name, 0) + 1
+        if "vllm_omni.diffusion.attention.backends.flash_attn.FlashAttentionImpl" in implementations:
+            from vllm_omni.diffusion.attention.backends.utils import fa
+
+            return {**implementations, "flash_attention_bindings": describe_flash_bindings(fa)}
         return implementations
 
     def read_helios_timers(self) -> dict:

@@ -43,3 +43,17 @@ def test_stage_durations_preserve_existing_milliseconds():
         "queue_wait_ms": 0.25,
         "stage_0_gen_ms": 23000.0,
     }
+
+
+def test_flash_bindings_describe_resolved_functions():
+    from types import SimpleNamespace
+
+    from benchmarks.diffusion.benchmark_helios_attention import describe_flash_bindings
+
+    def forward():
+        pass
+
+    forward.__module__ = "fa3_fwd_interface"
+    result = describe_flash_bindings(SimpleNamespace(flash_attn_func=forward, flash_attn_varlen_func=None))
+    assert result["flash_attn_func"] == {"module": "fa3_fwd_interface", "qualname": forward.__qualname__}
+    assert result["flash_attn_varlen_func"] is None

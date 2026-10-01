@@ -11,12 +11,11 @@ import json
 from pathlib import Path
 
 import numpy as np
-from skimage.metrics import structural_similarity
 
 BACKENDS = ("TORCH_SDPA", "FLASH_ATTN", "CUDNN_ATTN")
 
 
-def compare(left: np.ndarray, right: np.ndarray) -> dict:
+def compare_metrics(left: np.ndarray, right: np.ndarray) -> dict:
     if left.shape != right.shape or left.ndim != 4 or left.shape[-1] != 3:
         raise ValueError(f"Expected matching FHWC RGB videos: {left.shape}, {right.shape}")
     if not np.isfinite(left).all() or not np.isfinite(right).all():
@@ -30,18 +29,21 @@ def compare(left: np.ndarray, right: np.ndarray) -> dict:
         "rmse": float(np.sqrt(mse)),
         # Exact equality has infinite PSNR; represent it without invalid JSON.
         "psnr_db": None if mse == 0 else float(-10 * np.log10(mse)),
-        "ssim_mean": float(
-            np.mean([structural_similarity(a, b, data_range=1.0, channel_axis=-1) for a, b in zip(left, right)])
-        ),
         "temporal_delta_mae": float(np.mean(np.abs(np.diff(left, axis=0) - np.diff(right, axis=0)))),
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root", type=Path)
-    args = parser.parse_args()
-    runs = {name: json.loads((args.root / name / "results.json").read_text()) for name in BACKENDS}
+def compare(left: np.ndarray, right: np.ndarray) -> dict:
+    metrics = compare_metrics(left, right)
+    from skimage.metrics import structural_similarity
+
+    metrics["ssim_mean"] = float(
+        np.mean([structural_similarity(a, b, data_range=1.0, channel_axis=-1) for a, b in zip(left, right)])
+    )
+    return metrics
+
+
+def validate_runs(runs: dict) -> dict:
     records = {}
     for name, data in runs.items():
         rows = [row for row in data["records"] if not row["warmup"]]
@@ -57,7 +59,6 @@ def main() -> None:
             raise ValueError(f"Incomplete or duplicate measurements: {name}")
         records[name] = keyed
     baseline = records["TORCH_SDPA"]
-    report = {"alignment_vs_torch_sdpa": {}, "self_variance": {}}
     reference_metadata = runs["TORCH_SDPA"]["metadata"]
     # Startup latency and the selector itself may differ; workload and software may not.
     ignored_fields = {"backend", "engine_startup_ms", "attention_implementations"}
@@ -66,20 +67,33 @@ def main() -> None:
         contract = {key: value for key, value in runs[name]["metadata"].items() if key not in ignored_fields}
         if contract != reference_contract or keyed.keys() != baseline.keys():
             raise ValueError(f"Workload or environment differs from TORCH_SDPA: {name}")
+        for (frames, seed, repeat), row in keyed.items():
+            if row["prompt"] != baseline[(frames, seed, repeat)]["prompt"]:
+                raise ValueError(f"Prompt mismatch: {name}, {frames}, {seed}, {repeat}")
+            if row["prompt"] != keyed[(frames, seed, 0)]["prompt"]:
+                raise ValueError(f"Prompt changed between repetitions: {name}")
+    return records
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    args = parser.parse_args()
+    runs = {name: json.loads((args.root / name / "results.json").read_text()) for name in BACKENDS}
+    records = validate_runs(runs)
+    baseline = records["TORCH_SDPA"]
+    report = {"alignment_vs_torch_sdpa": {}, "self_variance": {}}
+    for name, keyed in records.items():
         report["alignment_vs_torch_sdpa"][name] = []
         report["self_variance"][name] = []
         for (frames, seed, repeat), row in keyed.items():
             reference = baseline[(frames, seed, repeat)]
-            if row["prompt"] != reference["prompt"]:
-                raise ValueError(f"Prompt mismatch: {name}, {frames}, {seed}, {repeat}")
             output = np.load(args.root / name / row["array"], allow_pickle=False)
             if repeat == 0:
                 other = np.load(args.root / "TORCH_SDPA" / reference["array"], allow_pickle=False)
                 group = "alignment_vs_torch_sdpa"
             else:
                 first = keyed[(frames, seed, 0)]
-                if row["prompt"] != first["prompt"]:
-                    raise ValueError(f"Prompt changed between repetitions: {name}")
                 other = np.load(args.root / name / first["array"], allow_pickle=False)
                 group = "self_variance"
             report[group][name].append({"num_frames": frames, "seed": seed, "repeat": repeat, **compare(other, output)})
