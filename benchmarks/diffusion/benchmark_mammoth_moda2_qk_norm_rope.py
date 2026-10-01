@@ -20,12 +20,12 @@ import statistics
 from collections.abc import Callable
 
 import torch
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
 )
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.mammoth_moda2.rope_real import (
     apply_real_rotary_emb,
 )
@@ -93,8 +93,8 @@ def _run_shape(tokens: int, warmup: int, iters: int, *, fused_first: bool = Fals
     torch.manual_seed(42)
     query = torch.randn(tokens, _Q_HEADS, _HEAD_DIM, device=device, dtype=dtype)
     key = torch.randn(tokens, _KV_HEADS, _HEAD_DIM, device=device, dtype=dtype)
-    norm_q = Qwen2RMSNorm(_HEAD_DIM, eps=_EPS).to(device=device, dtype=dtype)
-    norm_k = Qwen2RMSNorm(_HEAD_DIM, eps=_EPS).to(device=device, dtype=dtype)
+    norm_q = RMSNorm(_HEAD_DIM, eps=_EPS).to(device=device, dtype=dtype)
+    norm_k = RMSNorm(_HEAD_DIM, eps=_EPS).to(device=device, dtype=dtype)
     norm_q.weight.normal_(mean=1.0, std=0.2)
     norm_k.weight.normal_(mean=1.0, std=0.2)
     angles = torch.rand(tokens, _HEAD_DIM // 2, device=device) * (2 * torch.pi)

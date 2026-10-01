@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Real-shape checks for MammothModa2's fused QK norm/RoPE and shared CUDA
-attention backend against the pre-change bf16 arithmetic."""
+attention backend against the native shared RMSNorm path."""
 
 import pytest
 import torch
 from diffusers.models.attention_processor import Attention
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
 from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
 from .test_dit_attention import _reference_attention
@@ -28,8 +28,8 @@ DIM, HEADS, KV_HEADS = 2520, 21, 7
 
 def _norm_attention(head_dim, dtype):
     attn = Attention(query_dim=head_dim * HEADS, heads=HEADS, kv_heads=KV_HEADS, dim_head=head_dim)
-    attn.norm_q = Qwen2RMSNorm(head_dim)
-    attn.norm_k = Qwen2RMSNorm(head_dim)
+    attn.norm_q = RMSNorm(head_dim)
+    attn.norm_k = RMSNorm(head_dim)
     return attn.to(device="cuda", dtype=dtype)
 
 
