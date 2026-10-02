@@ -7,6 +7,7 @@ This reports numerical alignment, not a perceptual-quality pass/fail threshold.
 """
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -75,6 +76,15 @@ def validate_runs(runs: dict) -> dict:
     return records
 
 
+def load_verified_array(root: Path, backend: str, row: dict) -> np.ndarray:
+    path = root / backend / row["array"]
+    output = np.load(path, allow_pickle=False)
+    digest = hashlib.sha256(np.ascontiguousarray(output, dtype=np.float32).tobytes()).hexdigest()
+    if digest != row["sha256"]:
+        raise ValueError(f"npy hash mismatch: {path}")
+    return output
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
@@ -88,13 +98,13 @@ def main() -> None:
         report["self_variance"][name] = []
         for (frames, seed, repeat), row in keyed.items():
             reference = baseline[(frames, seed, repeat)]
-            output = np.load(args.root / name / row["array"], allow_pickle=False)
+            output = load_verified_array(args.root, name, row)
             if repeat == 0:
-                other = np.load(args.root / "TORCH_SDPA" / reference["array"], allow_pickle=False)
+                other = load_verified_array(args.root, "TORCH_SDPA", reference)
                 group = "alignment_vs_torch_sdpa"
             else:
                 first = keyed[(frames, seed, 0)]
-                other = np.load(args.root / name / first["array"], allow_pickle=False)
+                other = load_verified_array(args.root, name, first)
                 group = "self_variance"
             report[group][name].append({"num_frames": frames, "seed": seed, "repeat": repeat, **compare(other, output)})
     output_path = args.root / "alignment.json"

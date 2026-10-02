@@ -57,3 +57,70 @@ def test_flash_bindings_describe_resolved_functions():
     result = describe_flash_bindings(SimpleNamespace(flash_attn_func=forward, flash_attn_varlen_func=None))
     assert result["flash_attn_func"] == {"module": "fa3_fwd_interface", "qualname": forward.__qualname__}
     assert result["flash_attn_varlen_func"] is None
+
+
+@pytest.mark.parametrize(
+    "frames,steps,amplify,expected",
+    [(33, [2, 2, 2], True, 12), (66, [2, 2, 2], True, 18), (66, [1, 2, 3], False, 12), (33, [1, 1, 1], True, 6)],
+)
+def test_expected_forwards_follow_sampling_config(frames, steps, amplify, expected):
+    from benchmarks.diffusion.benchmark_helios_attention import expected_transformer_forwards
+
+    assert (
+        expected_transformer_forwards(
+            frames, {"pyramid_num_inference_steps_list": steps, "is_amplify_first_chunk": amplify}
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        [],
+        ["--repeats", "0"],
+        ["--warmup", "0"],
+        ["--frames", "34"],
+        ["--frames", "33", "33"],
+        ["--seeds", "42", "42"],
+        ["--backend", "INVALID"],
+        ["--model", "/nonexistent/helios-checkpoint"],
+    ],
+)
+def test_cli_contract(tmp_path, monkeypatch, extra):
+    from benchmarks.diffusion.benchmark_helios_attention import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "benchmark",
+            "--model",
+            str(tmp_path),
+            "--backend",
+            "TORCH_SDPA",
+            "--output-dir",
+            str(tmp_path / "output"),
+            *extra,
+        ],
+    )
+    if extra:
+        with pytest.raises(SystemExit) as exc:
+            parse_args()
+        assert exc.value.code == 2
+    else:
+        args = parse_args()
+        assert args.frames == [33, 66]
+        assert args.repeats == 3
+
+
+def test_cli_preserves_existing_evidence(tmp_path, monkeypatch):
+    from benchmarks.diffusion.benchmark_helios_attention import parse_args
+
+    evidence = tmp_path / "results.json"
+    evidence.write_text("original")
+    monkeypatch.setattr(
+        "sys.argv", ["benchmark", "--model", str(tmp_path), "--backend", "TORCH_SDPA", "--output-dir", str(tmp_path)]
+    )
+    with pytest.raises(SystemExit):
+        parse_args()
+    assert evidence.read_text() == "original"

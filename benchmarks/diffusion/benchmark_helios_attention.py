@@ -120,6 +120,12 @@ def summarize_runs(records: list[dict]) -> dict[int, dict]:
     return summary
 
 
+def expected_transformer_forwards(frames: int, extra_args: dict) -> int:
+    """Count forwards for the Distilled stage-2, 33-frame-chunk workload."""
+    base_steps = sum(extra_args["pyramid_num_inference_steps_list"])
+    return base_steps * (frames // 33 + int(extra_args["is_amplify_first_chunk"]))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Pinned local Helios-Distilled checkpoint directory.")
@@ -240,7 +246,7 @@ def main() -> None:
                 transformer_timings = one_worker_result(omni.engine.collective_rpc(method="read_helios_timers"))[
                     "steps"
                 ]
-                expected_forwards = 6 * (count // 33 + 1)
+                expected_forwards = expected_transformer_forwards(count, extra_args)
                 if len(transformer_timings) != expected_forwards:
                     raise ValueError(f"Expected {expected_forwards} forwards, got {len(transformer_timings)}")
                 transformer_gpu_ms = sum(step["gpu_ms"] for step in transformer_timings)

@@ -163,9 +163,9 @@ parentheses are the minimum and maximum request wall times.
 | `FLASH_ATTN` | 66 | 32820.8 (32802.0–32843.0) | 29508.8 | 1639.4 | 46.47 |
 | `CUDNN_ATTN` | 66 | 32827.0 (32813.5–32843.0) | 29514.0 | 1639.7 | 46.47 |
 
-Relative to `TORCH_SDPA`, FA3 reduced median request latency by **9.14%** for
+Relative to `TORCH_SDPA`, `FLASH_ATTN` (with `fa3-fwd` installed) reduced median request latency by **9.14%** for
 33 frames and **8.95%** for 66 frames. Transformer device time fell by about
-9.85%. cuDNN delivered effectively the same latency as FA3: their differences
+9.85%. cuDNN delivered effectively the same latency as `FLASH_ATTN`: their differences
 of 2.2/6.2 ms are smaller than the observed within-backend ranges. Peak worker
 reserved memory was unchanged. This is an existing-backend comparison on the
 same runtime, not a before/after production-code optimization.
@@ -194,7 +194,14 @@ unpatched runtime.
 
 ## Compare output alignment
 
-Install `scikit-image` in the benchmark environment, then run:
+SSIM is an optional analysis dependency, installed separately from the runtime.
+To reproduce the recorded analysis version, run:
+
+```bash
+python -m pip install scikit-image==0.26.0
+```
+
+Then run:
 
 ```bash
 python -m benchmarks.diffusion.compare_helios_attention helios-attention
@@ -205,7 +212,8 @@ PSNR, mean per-frame SSIM, and temporal-difference MAE. It compares the first
 repetition of each case against `TORCH_SDPA`, and the remaining repetitions
 against the same backend's first output. Exact equality is recorded explicitly;
 its infinite PSNR is represented as JSON `null`. The tool rejects incomplete
-matrices or differing workload/environment metadata. These metrics quantify
+matrices, differing workload/environment metadata, or arrays whose SHA256 does
+not match the recorded contiguous float32 buffer digest. These metrics quantify
 numerical alignment; they do not establish perceptual quality on a broad video
 benchmark.
 
@@ -241,7 +249,7 @@ are normalized to `[0, 1]`.
 
 | Backend versus SDPA | MAE | RMSE | PSNR, dB | Mean frame SSIM | Temporal-delta MAE | Largest pixel error |
 | --- | --- | --- | --- | --- | --- | ---: |
-| FA3 | 0.00620–0.01472 | 0.01593–0.04238 | 27.46–35.95 | 0.93431–0.98788 | 0.00447–0.01337 | 1.00000 |
+| `FLASH_ATTN` (`fa3-fwd` installed) | 0.00620–0.01472 | 0.01593–0.04238 | 27.46–35.95 | 0.93431–0.98788 | 0.00447–0.01337 | 1.00000 |
 | cuDNN | 0.00633–0.01368 | 0.01555–0.04088 | 27.77–36.16 | 0.94409–0.98712 | 0.00500–0.01096 | 0.99778 |
 
 Average alignment does not imply pixel-level equivalence: the largest local
@@ -263,7 +271,7 @@ switching an established workload. Keep `TORCH_SDPA` when reproducing these
 SDPA reference outputs is the priority. This recipe does not recommend Sage,
 quantization, or a backend choice for other hardware.
 
-The following FA3 command uses the shared example in a fresh process for one
+The following `FLASH_ATTN` command uses the shared example in a fresh process for one
 request, so it does not reuse a previous request's prompt cache:
 
 ```bash

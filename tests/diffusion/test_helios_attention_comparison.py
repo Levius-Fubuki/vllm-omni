@@ -119,3 +119,52 @@ def test_ssim_matches_exact_frames_when_available():
     result = compare(video, video.copy())
     assert result["ssim_mean"] == 1.0
     assert result["psnr_db"] is None
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_main_groups_repeats_and_verifies_arrays(tmp_path, monkeypatch, tamper):
+    import hashlib
+    import json
+
+    from benchmarks.diffusion import compare_helios_attention as comparison
+
+    runs = sample_runs()
+    for index, (name, run) in enumerate(runs.items()):
+        directory = tmp_path / name
+        directory.mkdir()
+        run["metadata"]["repeats"] = 2
+        run["records"] = []
+        for repeat in range(2):
+            video = np.full((2, 8, 8, 3), index * 0.25 + repeat * 0.0625, dtype=np.float32)
+            row = {
+                "warmup": False,
+                "num_frames": 33,
+                "seed": 42,
+                "repeat": repeat,
+                "prompt": "train",
+                "array": f"{repeat}.npy",
+                "sha256": hashlib.sha256(video.tobytes()).hexdigest(),
+            }
+            run["records"].append(row)
+            if tamper and name == "FLASH_ATTN" and repeat == 1:
+                video += 0.125
+            np.save(directory / row["array"], video)
+        (directory / "results.json").write_text(json.dumps(run))
+    # Exercise real I/O and grouping without making SSIM a CPU-lane dependency.
+    monkeypatch.setattr(comparison, "compare", comparison.compare_metrics)
+    monkeypatch.setattr("sys.argv", ["compare", str(tmp_path)])
+    if tamper:
+        with pytest.raises(ValueError, match="hash mismatch"):
+            comparison.main()
+        assert not (tmp_path / "alignment.json").exists()
+    else:
+        comparison.main()
+        report = json.loads((tmp_path / "alignment.json").read_text())
+        for index, name in enumerate(runs):
+            cross = report["alignment_vs_torch_sdpa"][name]
+            own = report["self_variance"][name]
+            assert len(cross) == len(own) == 1
+            assert cross[0]["repeat"] == 0
+            assert cross[0]["mae"] == index * 0.25
+            assert own[0]["repeat"] == 1
+            assert own[0]["mae"] == 0.0625
