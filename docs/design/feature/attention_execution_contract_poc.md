@@ -23,12 +23,19 @@ capabilities are also `UNMIGRATED`, because the runtime GQA decision needs
 actual tensors. Non-divisible Q/KV head ratios report `UNSUPPORTED` with the
 same actionable error as forward.
 
-All supported SDPA paths declare advisory `EAGER_ONLY`: on RTX 4090 with
-PyTorch 2.13.0+cu132, `torch.compile(fullgraph=True)` failed at the existing
-PyTorch `SDPAParams`/pybind GQA probe for native GQA, masked expanded K/V, and
-unmasked expanded K/V. No custom-op or compile-boundary change is included in
-this migration. A caller requesting guaranteed fullgraph receives an
-unsupported contract result; ordinary forward behavior remains unchanged.
+Verified inference paths declare `TRACEABLE` for equal Q/KV heads and
+`CUSTOM_OP` for GQA. The equal-head path passes a concrete boolean to SDPA;
+the compiled CUDA GQA path wraps the runtime `SDPAParams` probe and native/
+expanded-KV dispatch in an opaque custom op. Both eager execution and the
+custom op use the same SDPA helper. The op returns contiguous BHSD output so
+its fake implementation can declare exact strides; the caller restores BSHD.
+Eager calls and non-CUDA entrypoints do not use this custom-op boundary.
+Autograd fullgraph execution is not verified: inputs requiring gradients
+retain `EAGER_ONLY` and bypass the inference-only custom op. A gradient-bearing
+mask also bypasses that op. CUDA autocast capability reporting remains
+`UNMIGRATED`, because route inspection on the original tensors does not
+describe the cast inputs. Compiled execution explicitly casts eligible tensors
+before the opaque boundary to preserve SDPA output dtype under autocast.
 
 The CUDA regression matrix was rerun after rebasing onto merged PR #7379
 (`596487fe6`) on an RTX 4090 (SM89, driver 595.71.05), Python 3.12.3,
@@ -43,6 +50,22 @@ The new CUDA test file uses the repository's L4 resource marker for CI routing
 (also SM89) and explicitly skips when CUDA is unavailable; an unfiltered run
 with CUDA hidden skipped all 57 GPU cases. CPU-only CI checks conservative
 pre-construction and device mismatch but does not claim CUDA path coverage.
+
+The fullgraph follow-up reproduced 12 failures before the change: equal-head
+calls passed a `SymBool` to SDPA's boolean `enable_gqa` argument, and GQA calls
+attempted to trace the pybind `SDPAParams` constructor. After the change, all
+12 Inductor cases passed with `fullgraph=True, dynamic=True`, FP16/BF16,
+masked/unmasked inputs, and two Q/K lengths with fresh data per case. Six
+additional cases compile the production `Attention.forward` entrypoint and
+verify its contract. Four `opcheck` cases validate schema, fake output, and
+dynamic AOT dispatch. Twelve mixed-autocast cases check FP16/BF16 conversion
+and additive-mask values; a mask-only-gradient case preserves the existing
+eager fallback with graph breaks. With these and conservative capability
+guards, the focused suite passes 137 tests on the same RTX 4090 environment. This
+does not claim training, end-to-end model, CUDA-graph capture, or performance
+coverage, nor guarantee one graph across arbitrary shapes.
+The contiguous BHSD boundary may introduce an output copy and a subsequent
+reshape copy; realistic-shape performance impact has not been benchmarked.
 
 ## Execution contract
 

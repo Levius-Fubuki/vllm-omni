@@ -89,7 +89,7 @@ def test_sdpa_contract_keeps_parallel_and_causal_paths_unmigrated():
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_sdpa_contract_does_not_promise_fullgraph(monkeypatch):
+def test_sdpa_contract_supports_fullgraph_for_inference(monkeypatch):
     monkeypatch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", lambda *args: True)
     query = torch.empty((1, 3, 4, 64), device="cuda", dtype=torch.bfloat16)
     key = torch.empty((1, 3, 2, 64), device="cuda", dtype=torch.bfloat16)
@@ -98,8 +98,32 @@ def test_sdpa_contract_does_not_promise_fullgraph(monkeypatch):
 
     result = impl.resolve_execution_path(context, query, key, key, None)
 
+    assert result.compilation_mode is CompilationMode.CUSTOM_OP
+    assert result.requested_support(context).status is SupportStatus.SUPPORTED
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("kv_heads", [2, 4])
+def test_sdpa_contract_does_not_promise_gqa_autograd_fullgraph(kv_heads):
+    query = torch.empty((1, 3, 4, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.empty((1, 3, kv_heads, 64), device="cuda", dtype=torch.bfloat16)
+    impl = SDPAImpl(num_heads=4, num_kv_heads=kv_heads, head_size=64, softmax_scale=0.5)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+
+    result = impl.resolve_execution_path(context, query, key, key, None)
+
     assert result.compilation_mode is CompilationMode.EAGER_ONLY
     assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_sdpa_autocast_contract_remains_unmigrated():
+    query = torch.empty((1, 3, 4, 64), device="cuda", dtype=torch.bfloat16)
+    key = torch.empty((1, 7, 2, 64), device="cuda", dtype=torch.bfloat16)
+    impl = SDPAImpl(num_heads=4, num_kv_heads=2, head_size=64, softmax_scale=0.5)
+    with torch.autocast("cuda", dtype=torch.float16):
+        result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, key, key, None)
+    assert result.support.status is SupportStatus.UNMIGRATED
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

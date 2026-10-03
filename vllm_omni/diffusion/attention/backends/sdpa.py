@@ -38,6 +38,73 @@ def _sdpa_uses_expanded_kv(
     return query.shape[1] != key.shape[1] and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, causal)
 
 
+def _sdpa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    # SDPA requires a concrete bool, not a symbolic head-count comparison.
+    enable_gqa = False
+    if query.shape[1] != key.shape[1]:
+        enable_gqa = True
+        if _sdpa_uses_expanded_kv(query, key, value, attention_mask, causal):
+            if query.shape[1] % key.shape[1] != 0:
+                raise ValueError(
+                    "GQA requires query heads to be a multiple of KV heads, "
+                    f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
+                )
+            repeat_num = query.shape[1] // key.shape[1]
+            key = key.repeat_interleave(repeat_num, dim=1)
+            value = value.repeat_interleave(repeat_num, dim=1)
+            enable_gqa = False
+            logger.debug(
+                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
+            )
+    return torch.nn.functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=causal, scale=scale, enable_gqa=enable_gqa
+    )
+
+
+if not hasattr(torch.ops.vllm_omni, "sdpa_gqa_attention"):
+
+    @torch.library.custom_op("vllm_omni::sdpa_gqa_attention", mutates_args=())
+    def _sdpa_gqa_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        causal: bool,
+        scale: float,
+    ) -> torch.Tensor:
+        # Keep SDPAParams and runtime kernel selection opaque to Dynamo.
+        # Normalize the layout so fake and real outputs have identical strides.
+        return _sdpa_attention(query, key, value, attention_mask, causal, scale).contiguous()
+
+    @_sdpa_gqa_attention_op.register_fake
+    def _sdpa_gqa_attention_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        causal: bool,
+        scale: float,
+    ) -> torch.Tensor:
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_sdpa_gqa_attention_op = torch.ops.vllm_omni.sdpa_gqa_attention
+
+
+def _cast_sdpa_autocast_input(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # Mirror SDPA's lower-precision autocast inputs, preserving bool/double masks.
+    if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return tensor.to(dtype=dtype)
+    return tensor
+
+
 def _maybe_reshape_attn_mask(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -125,6 +192,7 @@ class SDPAImpl(AttentionImpl):
         if (
             context.platform != "cuda"
             or not query.is_cuda
+            or torch.is_autocast_enabled("cuda")
             or self.causal
             or context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
@@ -199,11 +267,15 @@ class SDPAImpl(AttentionImpl):
             path = "sdpa_expanded_kv"
         else:
             path = "sdpa_native_gqa"
+        compilation_mode = CompilationMode.TRACEABLE if q_heads == kv_heads else CompilationMode.CUSTOM_OP
+        if any(tensor.requires_grad for tensor in (query, key, value)):
+            # Only inference compilation is verified; the custom op has no backward.
+            compilation_mode = CompilationMode.EAGER_ONLY
         return ExecutionPathResult(
             backend="SDPA",
             path=path,
             support=CapabilityResult.supported(),
-            compilation_mode=CompilationMode.EAGER_ONLY,
+            compilation_mode=compilation_mode,
             platform=context.platform,
             kernel_variant=None,
             parallel_strategy=context.parallel_strategy,
@@ -216,6 +288,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
         mask_mode: SDPAMaskMode = "broadcast_k",
+        use_gqa_custom_op: bool = False,
     ) -> torch.Tensor:
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
@@ -223,34 +296,25 @@ class SDPAImpl(AttentionImpl):
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
-        enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
-        # cannot select a fused GQA kernel for the runtime shape/mask, expand
-        # K/V locally so it can use the better-supported equal-head path.
-        if enable_gqa and _sdpa_uses_expanded_kv(query, key, value, attention_mask, self.causal):
-            if query.shape[1] % key.shape[1] != 0:
-                raise ValueError(
-                    "GQA requires query heads to be a multiple of KV heads, "
-                    f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
-                )
-            repeat_num = query.shape[1] // key.shape[1]
-            key = key.repeat_interleave(repeat_num, dim=1)
-            value = value.repeat_interleave(repeat_num, dim=1)
-            enable_gqa = False
-            logger.debug(
-                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
-            )
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
-            enable_gqa=enable_gqa,
-        )
+        if (
+            use_gqa_custom_op
+            and torch.compiler.is_compiling()
+            and query.is_cuda
+            and query.shape[1] != key.shape[1]
+            and not any(tensor.requires_grad for tensor in (query, key, value))
+            and (attention_mask is None or not attention_mask.requires_grad)
+        ):
+            # A compiled custom op does not inherit SDPA's autocast policy.
+            # Cast before the boundary so real and fake outputs agree on dtype.
+            if torch.is_autocast_enabled("cuda"):
+                dtype = torch.get_autocast_dtype("cuda")
+                query, key, value = (_cast_sdpa_autocast_input(tensor, dtype) for tensor in (query, key, value))
+                if attention_mask is not None:
+                    attention_mask = _cast_sdpa_autocast_input(attention_mask, dtype)
+            output = _sdpa_gqa_attention_op(query, key, value, attention_mask, self.causal, self.softmax_scale)
+        else:
+            output = _sdpa_attention(query, key, value, attention_mask, self.causal, self.softmax_scale)
         out = output.permute(0, 2, 1, 3)
         return out
 
@@ -261,7 +325,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k", use_gqa_custom_op=True)
 
     def forward_xpu(
         self,
