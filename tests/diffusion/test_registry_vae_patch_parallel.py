@@ -10,6 +10,7 @@ from torch import nn
 
 from vllm_omni.diffusion import registry
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
@@ -33,20 +34,26 @@ class _RecordingVae(nn.Module, DistributedVaeMixin):
         self.parallel_settings = (parallel_size, mode)
 
 
-def _initialize(mocker, *, attr: str, pp_size: int, use_tiling: bool = False):
+def _initialize(
+    mocker, *, attr: str, pp_size: int, use_tiling: bool = False, use_slicing: bool = False, mode: str = "tile"
+):
+    class _RecordingBatchVae(_RecordingVae, DistributedAutoencoderKL_base):
+        pass
+
     class _Pipeline(_DeclaredPipeline):
         _vae_modules = [attr]
 
         def __init__(self, *, od_config):
             super().__init__()
-            setattr(self, attr, _RecordingVae())
+            setattr(self, attr, _RecordingBatchVae() if mode == "batch" else _RecordingVae())
 
     mocker.patch.object(registry.DiffusionModelRegistry, "_try_load_model_cls", return_value=_Pipeline)
     mocker.patch.object(registry, "_apply_sequence_parallel_if_enabled")
     config = OmniDiffusionConfig(
         model_class_name="RecordingPipeline",
-        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=pp_size),
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=pp_size, vae_parallel_mode=mode),
         vae_use_tiling=use_tiling,
+        vae_use_slicing=use_slicing,
     )
     return registry.initialize_model(config), config
 
@@ -81,6 +88,25 @@ def test_declared_gen_vae_honors_explicit_tiling_with_one_rank(mocker):
 
     assert config.vae_use_tiling is True
     assert pipeline.gen_vae.use_tiling is True
+
+
+@pytest.mark.parametrize("attr", ["vae", "gen_vae"])
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_slicing_only_initialization_configures_discovered_vae(mocker, attr, pp_size):
+    pipeline, config = _initialize(mocker, attr=attr, pp_size=pp_size, use_slicing=True)
+    vae = getattr(pipeline, attr)
+
+    assert vae.use_slicing is True
+    assert vae.use_tiling is (pp_size > 1)
+    assert config.vae_use_tiling is (pp_size > 1)
+
+
+def test_declared_gen_vae_keeps_batch_mode_without_forcing_tiling(mocker):
+    pipeline, config = _initialize(mocker, attr="gen_vae", pp_size=2, mode="batch")
+
+    assert pipeline.gen_vae.parallel_settings == (2, "batch")
+    assert pipeline.gen_vae.use_tiling is False
+    assert config.vae_use_tiling is False
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])

@@ -278,7 +278,15 @@ vllm serve ./MammothModa2-Preview --omni \
 
 Mammoth's DiT attention is replicated, not sequence-sharded: the two-rank
 group is used to coordinate VAE tiles. The registry enables VAE tiling
-automatically when `vae_patch_parallel_size=2`. The VAE-only path was measured
+automatically when `vae_patch_parallel_size=2`. The spatial VAE path uses
+`vae_parallel_mode: tile`; `spatial_shard_height` and `spatial_shard_width`
+are unsupported for this VAE and raise an error. `vae_use_slicing: true`
+also applies to `gen_vae`, including single-rank slicing-only configurations.
+With distributed spatial decode, slicing processes one image at a time in
+the same order on every rank. This limits each tile/patch decoder input to
+a single batch row.
+
+The VAE-only path was measured
 on two RTX 3090s; this three-GPU AR→DiT deployment has not been validated
 end-to-end and needs sufficient memory for a full DiT copy on each stage-1
 GPU. Compare it against a one-rank stage-1 run on the same checkpoint, prompt,

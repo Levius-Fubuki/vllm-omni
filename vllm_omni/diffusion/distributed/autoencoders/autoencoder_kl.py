@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKL as Diffusers_AutoencoderKL
+from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -13,6 +16,11 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
     GridSpec,
     TileTask,
+)
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    get_data_parallel_world_size,
+    get_pipeline_parallel_world_size,
 )
 
 # from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL as Next_Step_AutoencoderKL
@@ -22,17 +30,76 @@ logger = init_logger(__name__)
 
 # We use base class because some model re-implement AutoencoderKL, but split is share.
 class DistributedAutoencoderKL_base(DistributedVaeMixin):
+    # Supplied by the concrete Diffusers autoencoder through the mixin MRO.
+    tile_latent_min_size: int
+    tile_sample_min_size: int
+    tile_overlap_factor: float
+    config: Any
+    post_quant_conv: torch.nn.Module
+    decoder: torch.nn.Module
+    dtype: torch.dtype
+    blend_v: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
+    blend_h: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
+
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        if mode not in {"tile", "batch"}:
+            raise ValueError(f"AutoencoderKL VAE parallel decode supports only 'tile' and 'batch'; got {mode!r}")
+        super().set_parallel_size(parallel_size, mode=mode)
+
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
-        model = super().from_pretrained(*args, **kwargs)
+        model = super().from_pretrained(*args, **kwargs)  # type: ignore[misc]
         model.init_distributed()
         return model
 
     @classmethod
     def from_config(cls, *args: Any, **kwargs: Any):
-        model = super().from_config(*args, **kwargs)
+        model = super().from_config(*args, **kwargs)  # type: ignore[misc]
         model.init_distributed()
         return model
+
+    def batch_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        executor = self.distributed_executor
+        num_chunks = min(z.shape[0], executor.parallel_size, executor.world_size)
+        tasks = [
+            TileTask(index, (index,), chunk, workload=chunk.shape[0])
+            for index, chunk in enumerate(z.tensor_split(num_chunks, dim=0))
+        ]
+        # The concrete diffusers base supplies dtype through the mixin MRO.
+        output_dtype = (
+            torch.get_autocast_dtype(z.device.type) if torch.is_autocast_enabled(z.device.type) else self.dtype  # type: ignore[attr-defined]
+        )
+        return tasks, GridSpec(split_dims=(0,), grid_shape=(num_chunks,), output_dtype=output_dtype)
+
+    def batch_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+        return torch.cat([coord_tensor_map[(index,)] for index in range(grid_spec.grid_shape[0])], dim=0)
+
+    def _batch_parallel_decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+        # Resolve the native decoder before defining the task callback. Calling
+        # self.decode here would recursively enter the distributed path. The
+        # concrete diffusers base supplies decode through the mixin MRO.
+        native_decode = super().decode  # type: ignore[misc]
+        executor = self.distributed_executor
+        if z.shape[0] <= 1 or min(executor.parallel_size, executor.world_size) <= 1 or not dist.is_initialized():
+            return native_decode(z, return_dict, *args, **kwargs)
+        if (
+            get_data_parallel_world_size() > 1
+            or get_pipeline_parallel_world_size() > 1
+            or get_classifier_free_guidance_world_size() > 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+
+        def decode_chunk(task: TileTask) -> torch.Tensor:
+            # Keep native slicing/tiling and decoder arguments for each complete
+            # image chunk; only the batch dimension is distributed.
+            return native_decode(task.tensor, False, *args, **kwargs)[0]
+
+        result = executor.execute(
+            z,
+            DistributedOperator(split=self.batch_split, exec=decode_chunk, merge=self.batch_merge),
+            broadcast_result=True,
+        )
+        return DecoderOutput(sample=result) if return_dict else (result,)
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
@@ -42,7 +109,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
         # Split z into overlapping 64x64 tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         for i in range(0, z.shape[2], overlap_size):
             for j in range(0, z.shape[3], overlap_size):
                 tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
@@ -106,7 +173,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             if max_parallel_size % rows == 0:
                 grid_rows, grid_cols = rows, max_parallel_size // rows
                 break
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         halo_size = dict()
         for i in range(grid_rows):
             for j in range(grid_cols):
@@ -185,17 +252,29 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
     # Normally, we should override tiled_decode. However, since we also need to
     # support the patch split strategy, we override decode instead.
     def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+        if self.distributed_executor.parallel_mode == "batch":
+            return self._batch_parallel_decode(z, return_dict, *args, **kwargs)
         if not self.is_distributed_enabled():
-            return super().decode(z, return_dict=return_dict, *args, **kwargs)
+            return super().decode(z, return_dict=return_dict, *args, **kwargs)  # type: ignore[misc]
 
         split, exec, merge = self._strategy_select(z)
 
         if split is not None:
             strategy = "tile" if split == self.tile_split else "patch"
             logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
-            result = self.distributed_executor.execute(
-                z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
-            )
+            operator = DistributedOperator(split=split, exec=exec, merge=merge)
+            if getattr(self, "use_slicing", False) and z.shape[0] > 1:
+                # Every rank enters collectives in the same image order, while
+                # each spatial decoder sees just one batch row, like Diffusers.
+                result = torch.cat(
+                    [
+                        self.distributed_executor.execute(slice_z, operator, broadcast_result=False)
+                        for slice_z in z.split(1)
+                    ],
+                    dim=0,
+                )
+            else:
+                result = self.distributed_executor.execute(z, operator, broadcast_result=False)
             if not return_dict:
                 return (result,)
 
@@ -203,7 +282,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
             return DecoderOutput(sample=result)
         else:
-            return super().decode(z, return_dict=return_dict, *args, **kwargs)
+            return super().decode(z, return_dict=return_dict, *args, **kwargs)  # type: ignore[misc]
 
 
 class DistributedAutoencoderKL(DistributedAutoencoderKL_base, Diffusers_AutoencoderKL):
