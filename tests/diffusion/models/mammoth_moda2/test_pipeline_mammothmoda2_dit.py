@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -453,7 +454,7 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
 
 
 @pytest.mark.parametrize("steps", [(1,), (1, 1), (1, 2)])
-def test_forward_syncs_final_latents_before_distributed_vae_decode(mocker, steps) -> None:
+def test_forward_replicated_decode_needs_no_latent_broadcast(mocker, steps) -> None:
     class _FakeDistributedVae(_FakeVae, DistributedVaeMixin):
         def __init__(self) -> None:
             super().__init__()
@@ -466,7 +467,7 @@ def test_forward_syncs_final_latents_before_distributed_vae_decode(mocker, steps
 
         def broadcast_tensor(self, latents):
             self.broadcast_calls += 1
-            return torch.full_like(latents, 3)
+            pytest.fail("Replicated Mammoth latents do not need a final broadcast")
 
         def decode(self, latents, return_dict=False):
             self.decoded_latents = latents.clone()
@@ -490,12 +491,12 @@ def test_forward_syncs_final_latents_before_distributed_vae_decode(mocker, steps
         ).requests[0]
         for i, count in enumerate(steps)
     ]
-    for repeat in range(2):
+    for _ in range(2):
         outputs = pipeline.forward(DiffusionRequestBatch(requests))
         assert len(outputs) == len(requests)
-        assert all(torch.all(output.output == 2.0) for output in outputs)
-        assert pipeline.gen_vae.broadcast_calls == (repeat + 1) * len(set(steps))
-        assert torch.all(pipeline.gen_vae.decoded_latents == 2.0)
+        assert all(torch.all(output.output == 1.0) for output in outputs)
+        assert pipeline.gen_vae.broadcast_calls == 0
+        assert torch.all(pipeline.gen_vae.decoded_latents == 1.0)
 
 
 def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
@@ -1197,7 +1198,7 @@ def test_pre_process_normalizes_steps_before_scheduler_admission(
 
 
 @pytest.mark.parametrize("distributed_enabled", [False, True])
-def test_post_decode_syncs_latents_without_scaling_request_state(distributed_enabled: bool) -> None:
+def test_post_decode_uses_replicated_latents_without_scaling_request_state(distributed_enabled: bool) -> None:
     class _FakeDistributedVae(_FakeVae, DistributedVaeMixin):
         def __init__(self) -> None:
             super().__init__()
@@ -1209,7 +1210,7 @@ def test_post_decode_syncs_latents_without_scaling_request_state(distributed_ena
 
         def broadcast_tensor(self, latents):
             self.broadcast_calls += 1
-            return latents.fill_(3)
+            pytest.fail("Replicated Mammoth latents do not need a final broadcast")
 
     pipeline = _pipeline_shell()
     pipeline.gen_vae = _FakeDistributedVae().half()
@@ -1217,13 +1218,36 @@ def test_post_decode_syncs_latents_without_scaling_request_state(distributed_ena
     pipeline.gen_vae.config.shift_factor = 0.5
     state = SimpleNamespace(latents=torch.ones(1, 4, 4, 6), request_id="step-sync")
 
-    for repeat in range(2):
+    for _ in range(2):
         output = pipeline.post_decode(state)
-        expected = 2.0 if distributed_enabled else 1.0
+        expected = 1.0
         assert torch.all(output.output == expected)
         assert pipeline.gen_vae.last_decode_dtype == torch.float16
-        assert pipeline.gen_vae.broadcast_calls == (repeat + 1 if distributed_enabled else 0)
-        assert torch.all(state.latents == (3.0 if distributed_enabled else 1.0))
+        assert pipeline.gen_vae.broadcast_calls == 0
+        assert torch.all(state.latents == 1.0)
+
+
+@pytest.mark.parametrize("rng_source", ["random_seed", "seed", "generator"])
+def test_request_rng_state_produces_identical_replicated_latents(rng_source: str) -> None:
+    sampling = OmniDiffusionSamplingParams(
+        seed=42 if rng_source == "seed" else None,
+        generator=torch.Generator().manual_seed(42) if rng_source == "generator" else None,
+    )
+    # Materialize omitted seeds once, before the request is distributed.
+    request = OmniDiffusionRequest(prompt="test", sampling_params=sampling, request_id="replicated")
+    if rng_source != "generator":
+        assert request.sampling_params.seed is not None
+    outputs = []
+    for rank in range(2):
+        replica = deepcopy(request)
+        params = replica.sampling_params
+        pipeline = _pipeline_shell()
+        pipeline.gen_transformer = _FakeTransformer()
+        spec = SimpleNamespace(seed=params.seed, generator=params.generator, generator_device=None)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(100 + rank)  # Different ambient RNG does not affect request RNG.
+            outputs.append(pipeline._init_latents([spec], 32, 48, torch.device("cpu"), torch.float32))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
 
 def test_step_protocol_matches_request_mode() -> None:

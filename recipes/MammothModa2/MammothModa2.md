@@ -282,9 +282,9 @@ automatically when `vae_patch_parallel_size=2`. The spatial VAE path uses
 `vae_parallel_mode: tile`; `spatial_shard_height` and `spatial_shard_width`
 are unsupported for this VAE and raise an error. `vae_use_slicing: true`
 also applies to `gen_vae`, including single-rank slicing-only configurations.
-With distributed spatial decode, slicing processes one image at a time in
-the same order on every rank. This limits each tile/patch decoder input to
-a single batch row.
+With distributed spatial decode, slicing adds a batch coordinate to each
+tile/patch task. Each decoder input has a single batch row, and merge
+restores the original image order.
 
 The VAE-only path was measured
 on two RTX 3090s; this three-GPU AR→DiT deployment has not been validated

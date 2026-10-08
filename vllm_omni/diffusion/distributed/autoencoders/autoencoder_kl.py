@@ -101,6 +101,49 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         )
         return DecoderOutput(sample=result) if return_dict else (result,)
 
+    def _slice_spatial_tasks(
+        self, z: torch.Tensor, tasks: list[TileTask], grid_spec: GridSpec
+    ) -> tuple[list[TileTask], GridSpec]:
+        if not getattr(self, "use_slicing", False) or z.shape[0] <= 1:
+            return tasks, grid_spec
+        sliced_tasks = [
+            TileTask(
+                batch_index * len(tasks) + task.tile_id,
+                (batch_index, *task.grid_coord),
+                task.tensor[batch_index : batch_index + 1],
+                workload=task.workload,
+            )
+            for batch_index in range(z.shape[0])
+            for task in tasks
+        ]
+        return sliced_tasks, GridSpec(
+            split_dims=(0, *grid_spec.split_dims),
+            grid_shape=(z.shape[0], *grid_spec.grid_shape),
+            tile_spec=grid_spec.tile_spec,
+            output_dtype=grid_spec.output_dtype,
+        )
+
+    def _merge_sliced_spatial_tiles(
+        self,
+        coord_tensor_map: dict[tuple[int, ...], torch.Tensor],
+        grid_spec: GridSpec,
+        merge: Callable[[dict[tuple[int, ...], torch.Tensor], GridSpec], torch.Tensor],
+    ) -> torch.Tensor:
+        spatial_grid = GridSpec(
+            split_dims=grid_spec.split_dims[1:],
+            grid_shape=grid_spec.grid_shape[1:],
+            tile_spec=grid_spec.tile_spec,
+            output_dtype=grid_spec.output_dtype,
+        )
+        images = [
+            merge(
+                {coord[1:]: tensor for coord, tensor in coord_tensor_map.items() if coord[0] == batch_index},
+                spatial_grid,
+            )
+            for batch_index in range(grid_spec.grid_shape[0])
+        ]
+        return torch.cat(images, dim=0)
+
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
         overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
@@ -131,7 +174,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
             tile_spec=tile_spec,
         )
-        return tiletask_list, grid_spec
+        return self._slice_spatial_tasks(z, tiletask_list, grid_spec)
 
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile into RGB space."""
@@ -143,6 +186,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
     def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
         """Merge decoded tiles into a full image."""
+
+        if grid_spec.split_dims[0] == 0:
+            return self._merge_sliced_spatial_tiles(coord_tensor_map, grid_spec, self.tile_merge)
 
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
@@ -208,12 +254,14 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             tile_spec=tile_spec,
             output_dtype=self.dtype,
         )
-        return tiletask_list, grid_spec
+        return self._slice_spatial_tasks(z, tiletask_list, grid_spec)
 
     def patch_exec(self, task: TileTask) -> torch.Tensor:
         return self.tile_exec(task)
 
     def patch_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+        if grid_spec.split_dims[0] == 0:
+            return self._merge_sliced_spatial_tiles(coord_tensor_map, grid_spec, self.patch_merge)
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
         for i in range(grid_h):
@@ -263,18 +311,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             strategy = "tile" if split == self.tile_split else "patch"
             logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
             operator = DistributedOperator(split=split, exec=exec, merge=merge)
-            if getattr(self, "use_slicing", False) and z.shape[0] > 1:
-                # Every rank enters collectives in the same image order, while
-                # each spatial decoder sees just one batch row, like Diffusers.
-                result = torch.cat(
-                    [
-                        self.distributed_executor.execute(slice_z, operator, broadcast_result=False)
-                        for slice_z in z.split(1)
-                    ],
-                    dim=0,
-                )
-            else:
-                result = self.distributed_executor.execute(z, operator, broadcast_result=False)
+            result = self.distributed_executor.execute(z, operator, broadcast_result=False)
             if not return_dict:
                 return (result,)
 

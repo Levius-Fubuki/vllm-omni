@@ -20,7 +20,6 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
-from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -886,7 +885,6 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
             latents = latents.to(dtype=target_dtype)
 
         # VAE decode (in-place scaling to reduce peak VRAM before decode)
-        latents = self._sync_latents_for_vae_decode(latents)
         if self.gen_vae.config.scaling_factor is not None:
             latents.div_(self.gen_vae.config.scaling_factor)
         if self.gen_vae.config.shift_factor is not None:
@@ -926,12 +924,6 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         if any(output is None for output in outputs):
             raise RuntimeError("DiT batching produced no image for at least one scheduled request")
         return [output for output in outputs if output is not None]
-
-    def _sync_latents_for_vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Give each VAE tile rank the same final latent from rank 0."""
-        if isinstance(self.gen_vae, DistributedVaeMixin) and self.gen_vae.is_distributed_enabled():
-            return self.gen_vae.distributed_executor.broadcast_tensor(latents)
-        return latents
 
     def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
         del kwargs
@@ -1071,7 +1063,7 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         del kwargs
         if state.latents is None:
             raise ValueError(f"MammothModa2 has no final latents for request {state.request_id}")
-        latents = self._sync_latents_for_vae_decode(state.latents)
+        latents = state.latents
         if self.gen_vae.config.scaling_factor is not None:
             latents = latents / self.gen_vae.config.scaling_factor
         if self.gen_vae.config.shift_factor is not None:

@@ -52,6 +52,14 @@ def _slicing_worker(rank, rendezvous):
             vae = _make_vae()
             vae.init_distributed()
             vae.set_parallel_size(2)
+            execute = vae.distributed_executor.execute
+            execute_batches = []
+
+            def record_execute(z, operator, **kwargs):
+                execute_batches.append(z.shape[0])
+                return execute(z, operator, **kwargs)
+
+            patch.setattr(vae.distributed_executor, "execute", record_execute)
             for spatial_size in (4, 6):  # patch and tiled strategies
                 for slicing in (False, True):
                     vae.use_slicing = slicing
@@ -60,16 +68,26 @@ def _slicing_worker(rank, rendezvous):
                             z = torch.arange(1, batch_size + 1, dtype=torch.float32).reshape(-1, 1, 1, 1)
                             z = z.expand(-1, 1, spatial_size, spatial_size).clone()
                             vae.decoder.inputs.clear()
+                            execute_batches.clear()
                             with torch.no_grad():
                                 result = vae.decode(z, return_dict=return_dict)
                             output = result.sample if return_dict else result[0]
+                            assert execute_batches == [batch_size]
                             assert vae.decoder.inputs
                             expected_width = 1 if slicing else batch_size
                             assert all(tensor.shape[0] == expected_width for tensor in vae.decoder.inputs)
-                            if slicing:
-                                order = [int(tensor[0, 0, 0, 0]) for tensor in vae.decoder.inputs]
-                                assert order == sorted(order)
-                                assert set(order) == set(range(1, batch_size + 1))
+                            if slicing and batch_size > 1:
+                                split, _, _ = vae._strategy_select(z)
+                                tasks, grid = split(z)
+                                assert grid.split_dims == (0, 2, 3)
+                                assert grid.grid_shape[0] == batch_size
+                                batch_order = [task.grid_coord[0] for task in tasks]
+                                assert batch_order == sorted(batch_order)
+                                assert set(batch_order) == set(range(batch_size))
+                                assert [task.tile_id for task in tasks] == list(range(len(tasks)))
+                                layouts = [None, None]
+                                dist.all_gather_object(layouts, [task.grid_coord for task in tasks])
+                                assert layouts[0] == layouts[1]
                             if rank == 0:
                                 torch.testing.assert_close(output, z.repeat(1, 3, 1, 1), rtol=0, atol=0)
                             else:
