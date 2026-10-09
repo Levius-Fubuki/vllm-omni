@@ -51,6 +51,11 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
@@ -486,7 +491,7 @@ def initialize_model(
         if not isinstance(distributed_vae, DistributedVaeMixin):
             distributed_vae = None
         if (
-            vae_pp_size > 1 or od_config.vae_use_tiling or od_config.vae_use_slicing or vae_mode == "batch"
+            vae_pp_size > 1 or od_config.vae_use_tiling or od_config.vae_use_slicing or vae_mode != "tile"
         ) and distributed_vae is None:
             from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
@@ -495,12 +500,14 @@ def initialize_model(
             ]
             if len(declared_vaes) == 1:
                 distributed_vae = declared_vaes[0]
-            elif vae_pp_size > 1:
+            elif len(declared_vaes) > 1 or vae_pp_size > 1 or vae_mode != "tile":
                 logger.warning(
-                    "vae_patch_parallel_size=%d is set but found %d compatible VAEs for %s; ignoring.",
-                    vae_pp_size,
-                    len(declared_vaes),
+                    "Declared VAE settings for %s are ignored: found %d compatible distributed VAEs "
+                    "(vae_patch_parallel_size=%d, vae_parallel_mode=%s).",
                     od_config.model_class_name,
+                    len(declared_vaes),
+                    vae_pp_size,
+                    vae_mode,
                 )
 
         if vae_mode == "batch" and not isinstance(distributed_vae, DistributedAutoencoderKL_base):
@@ -677,6 +684,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
@@ -767,6 +775,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",

@@ -135,7 +135,9 @@ def test_plain_vae_warns_only_for_unsupported_parallelism(mocker, pp_size):
         warning.assert_called_once()
 
 
-def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("memory_mode", ["slicing", "tiling"])
+def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker, pp_size, memory_mode):
     class _Pipeline(_DeclaredPipeline):
         _vae_modules = ["gen_vae", "preview_vae"]
 
@@ -146,16 +148,69 @@ def test_multiple_declared_vaes_are_not_configured_ambiguously(mocker):
 
     mocker.patch.object(registry.DiffusionModelRegistry, "_try_load_model_cls", return_value=_Pipeline)
     mocker.patch.object(registry, "_apply_sequence_parallel_if_enabled")
+    warning = mocker.patch.object(registry.logger, "warning")
     config = OmniDiffusionConfig(
         model_class_name="RecordingPipeline",
-        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=2),
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=pp_size),
+        vae_use_slicing=memory_mode == "slicing",
+        vae_use_tiling=memory_mode == "tiling",
     )
 
     pipeline = registry.initialize_model(config)
 
-    assert config.vae_use_tiling is False
+    assert config.vae_use_tiling is (memory_mode == "tiling")
     assert pipeline.gen_vae.parallel_settings is None
     assert pipeline.preview_vae.parallel_settings is None
+    assert pipeline.gen_vae.use_slicing is False
+    assert pipeline.preview_vae.use_slicing is False
+    warning.assert_called_once()
+
+
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+def test_spatial_mode_only_discovers_vae_and_reaches_mode_validation(mocker, mode):
+    class _GuardedVae(nn.Module, DistributedAutoencoderKL_base):
+        pass
+
+    class _Pipeline(_DeclaredPipeline):
+        _vae_modules = ["gen_vae"]
+
+        def __init__(self, *, od_config):
+            super().__init__()
+            self.gen_vae = _GuardedVae()
+
+    mocker.patch.object(registry.DiffusionModelRegistry, "_try_load_model_cls", return_value=_Pipeline)
+    mocker.patch.object(registry, "_apply_sequence_parallel_if_enabled")
+    config = OmniDiffusionConfig(
+        model_class_name="RecordingPipeline",
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, vae_parallel_mode=mode),
+    )
+
+    assert config.vae_use_tiling is False
+    assert config.vae_use_slicing is False
+    with pytest.raises(ValueError, match="supports only.*tile.*batch"):
+        registry.initialize_model(config)
+
+
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+def test_spatial_mode_only_warns_when_no_compatible_vae_is_discovered(mocker, mode):
+    class _Pipeline(_DeclaredPipeline):
+        _vae_modules = ["gen_vae"]
+
+        def __init__(self, *, od_config):
+            super().__init__()
+            self.gen_vae = nn.Identity()
+
+    mocker.patch.object(registry.DiffusionModelRegistry, "_try_load_model_cls", return_value=_Pipeline)
+    mocker.patch.object(registry, "_apply_sequence_parallel_if_enabled")
+    warning = mocker.patch.object(registry.logger, "warning")
+    config = OmniDiffusionConfig(
+        model_class_name="PlainDeclaredVaePipeline",
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=1, vae_parallel_mode=mode),
+    )
+
+    registry.initialize_model(config)
+
+    warning.assert_called_once()
 
 
 def test_duplicate_declared_path_to_same_vae_is_configured_once(mocker):
