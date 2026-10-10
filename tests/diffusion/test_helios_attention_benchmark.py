@@ -64,14 +64,32 @@ def test_flash_bindings_describe_resolved_functions():
     [(33, [2, 2, 2], True, 12), (66, [2, 2, 2], True, 18), (66, [1, 2, 3], False, 12), (33, [1, 1, 1], True, 6)],
 )
 def test_expected_forwards_follow_sampling_config(frames, steps, amplify, expected):
+    import runpy
+    from pathlib import Path
+
+    from benchmarks.diffusion.benchmark_helios_attention import GUIDANCE_SCALE, expected_transformer_forwards
+
+    assert GUIDANCE_SCALE == 1.0  # This Distilled harness intentionally disables true CFG.
+    extra = {"pyramid_num_inference_steps_list": steps, "is_amplify_first_chunk": amplify}
+    assert expected_transformer_forwards(frames, extra, guidance_scale=GUIDANCE_SCALE) == expected
+    # Load the real scheduler without importing the GPU pipeline from helios/__init__.py.
+    path = Path(__file__).resolve().parents[2] / "vllm_omni/diffusion/models/helios/scheduling_helios.py"
+    scheduler = runpy.run_path(str(path))["HeliosScheduler"](scheduler_type="dmd", stages=3)
+    total = 0
+    for chunk in range(frames // 33):
+        for stage, num_steps in enumerate(steps):
+            scheduler.set_timesteps(num_steps, stage_index=stage, is_amplify_first_chunk=bool(amplify and chunk == 0))
+            total += len(scheduler.timesteps)
+    assert total == expected
+
+
+def test_forward_contract_rejects_cfg():
     from benchmarks.diffusion.benchmark_helios_attention import expected_transformer_forwards
 
-    assert (
+    with pytest.raises(ValueError, match="guidance_scale=1"):
         expected_transformer_forwards(
-            frames, {"pyramid_num_inference_steps_list": steps, "is_amplify_first_chunk": amplify}
+            33, {"pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": True}, guidance_scale=2.0
         )
-        == expected
-    )
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,8 @@ are not covered by the text-to-video example.
 
 ## References
 
+- [Distilled H20 attention comparison](Helios-Distilled-H20.md), with its own pinned runtime and isolated-request measurement contract.
+
 - Upstream repository: <https://github.com/PKU-YuanGroup/Helios>
 - Model weights:
   <https://huggingface.co/BestWishYsh/Helios-Base>
@@ -96,12 +98,6 @@ Saved generated video to helios_t2v_base.mp4
     - Helios-Distilled: `--extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}'`
 
 #### Known limitations
-
-- For the Distilled attention comparison, see the
-  [H20 isolated-request recipe](Helios-Distilled-H20.md). It documents the
-  cross-attention cache lifetime issue tracked by #8064 on its pinned runtime,
-  and clears the cache before each benchmark request while preserving reuse
-  within a request. Its results do not establish mixed-prompt serving correctness.
 
 - Helios generates video in 33-frame chunks. For best performance, set
   `--num-frames` to a multiple of `33`; non-multiple values are rounded up to

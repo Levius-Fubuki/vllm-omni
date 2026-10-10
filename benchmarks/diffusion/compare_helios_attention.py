@@ -50,6 +50,8 @@ def validate_runs(runs: dict) -> dict:
         rows = [row for row in data["records"] if not row["warmup"]]
         keyed = {(row["num_frames"], row["seed"], row["repeat"]): row for row in rows}
         metadata = data["metadata"]
+        if metadata.get("backend") != name:
+            raise ValueError(f"results.json backend does not match folder: {name}")
         expected = {
             (frames, seed, repeat)
             for frames in metadata["frames"]

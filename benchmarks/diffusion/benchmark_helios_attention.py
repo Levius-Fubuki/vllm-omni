@@ -17,6 +17,8 @@ import statistics
 import time
 from pathlib import Path
 
+GUIDANCE_SCALE = 1.0
+
 PROMPTS = [
     "A dynamic time-lapse video showing the rapidly moving scenery from the window of a speeding train.",
     "A golden retriever runs through a green meadow, its fur moving in the breeze, cinematic tracking shot.",
@@ -120,8 +122,10 @@ def summarize_runs(records: list[dict]) -> dict[int, dict]:
     return summary
 
 
-def expected_transformer_forwards(frames: int, extra_args: dict) -> int:
+def expected_transformer_forwards(frames: int, extra_args: dict, *, guidance_scale: float = GUIDANCE_SCALE) -> int:
     """Count forwards for the Distilled stage-2, 33-frame-chunk workload."""
+    if guidance_scale != 1.0:
+        raise ValueError("This Distilled benchmark requires guidance_scale=1 (CFG disabled)")
     base_steps = sum(extra_args["pyramid_num_inference_steps_list"])
     return base_steps * (frames // 33 + int(extra_args["is_amplify_first_chunk"]))
 
@@ -189,7 +193,7 @@ def main() -> None:
         "warmup_per_shape": args.warmup,
         "dit_text_encoder_dtype": "bfloat16",
         "vae_dtype": "float32",
-        "guidance_scale": 1.0,
+        "guidance_scale": GUIDANCE_SCALE,
         "extra_args": extra_args,
         "enforce_eager": True,
         "cache_backend": None,
@@ -236,7 +240,7 @@ def main() -> None:
                     width=640,
                     num_frames=count,
                     num_inference_steps=6,
-                    guidance_scale=1.0,
+                    guidance_scale=GUIDANCE_SCALE,
                     generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(seed),
                     extra_args=dict(extra_args),
                 )
@@ -246,7 +250,7 @@ def main() -> None:
                 transformer_timings = one_worker_result(omni.engine.collective_rpc(method="read_helios_timers"))[
                     "steps"
                 ]
-                expected_forwards = expected_transformer_forwards(count, extra_args)
+                expected_forwards = expected_transformer_forwards(count, extra_args, guidance_scale=GUIDANCE_SCALE)
                 if len(transformer_timings) != expected_forwards:
                     raise ValueError(f"Expected {expected_forwards} forwards, got {len(transformer_timings)}")
                 transformer_gpu_ms = sum(step["gpu_ms"] for step in transformer_timings)

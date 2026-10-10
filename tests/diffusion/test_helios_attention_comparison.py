@@ -168,3 +168,33 @@ def test_main_groups_repeats_and_verifies_arrays(tmp_path, monkeypatch, tamper):
             assert cross[0]["mae"] == index * 0.25
             assert own[0]["repeat"] == 1
             assert own[0]["mae"] == 0.0625
+
+
+@pytest.mark.parametrize("backend", ["TORCH_SDPA", None])
+def test_rejects_mislabeled_backend(backend):
+    from benchmarks.diffusion.compare_helios_attention import validate_runs
+
+    runs = sample_runs()
+    runs["FLASH_ATTN"]["metadata"]["backend"] = backend
+    with pytest.raises(ValueError, match="backend does not match folder"):
+        validate_runs(runs)
+
+
+def test_committed_h20_artifact_matches_export_contract():
+    import json
+    from pathlib import Path
+
+    from benchmarks.diffusion.compare_helios_attention import BACKENDS
+    from benchmarks.diffusion.export_helios_attention import PROVENANCE_KEYS, RECORD_KEYS
+
+    path = Path(__file__).resolve().parents[2] / "recipes/Helios/Helios-Distilled-H20-results.json"
+    artifact = json.loads(path.read_text())
+    assert set(PROVENANCE_KEYS) <= artifact.keys()
+    assert set(artifact["backends"]) == set(BACKENDS)
+    expected = {(frames, seed, repeat) for frames in (33, 66) for seed in (42, 7, 123) for repeat in range(3)}
+    for backend in artifact["backends"].values():
+        rows = backend["measurements"]
+        assert len(rows) == len(expected)
+        assert {(row["num_frames"], row["seed"], row["repeat"]) for row in rows} == expected
+        assert all(set(row) == set(RECORD_KEYS) for row in rows)
+        assert all(row["transformer_forward_count"] == {33: 12, 66: 18}[row["num_frames"]] for row in rows)
