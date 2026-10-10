@@ -102,11 +102,16 @@ def test_export_excludes_warmup_and_raw_timelines():
         row.update(transformer_timings=[{"gpu_ms": 1}], stage_durations_ms={"decode": 1})
         run["records"].append({"warmup": True})
     provenance = {key: "historical" for key in PROVENANCE_KEYS}
-    artifact = build_artifact(runs, {"alignment": "example"}, provenance)
+    alignment: dict = {"alignment_vs_torch_sdpa": {}, "self_variance": {}}
+    for name in runs:
+        alignment["alignment_vs_torch_sdpa"][name] = [{"num_frames": 33, "seed": 42, "repeat": 0}]
+        alignment["self_variance"][name] = []
+    artifact = build_artifact(runs, alignment, provenance)
     assert artifact["benchmark_script_sha256"] == "historical"
     assert "model" not in artifact["metadata"]
     assert artifact["prompts_by_seed"] == {"42": "train"}
     for backend in artifact["backends"].values():
+        assert backend["summary"][33]["median_wall_ms"] == 1
         assert len(backend["measurements"]) == 1
         assert set(backend["measurements"][0]) == set(RECORD_KEYS)
 
@@ -192,9 +197,66 @@ def test_committed_h20_artifact_matches_export_contract():
     assert set(PROVENANCE_KEYS) <= artifact.keys()
     assert set(artifact["backends"]) == set(BACKENDS)
     expected = {(frames, seed, repeat) for frames in (33, 66) for seed in (42, 7, 123) for repeat in range(3)}
-    for backend in artifact["backends"].values():
+    implementations = {
+        "TORCH_SDPA": "sdpa.SDPAImpl",
+        "FLASH_ATTN": "flash_attn.FlashAttentionImpl",
+        "CUDNN_ATTN": "cudnn_attn.CuDNNAttentionImpl",
+    }
+    hashes = {}
+    for name, backend in artifact["backends"].items():
+        assert backend["attention_implementations"] == {
+            f"vllm_omni.diffusion.attention.backends.{implementations[name]}": 80
+        }
         rows = backend["measurements"]
         assert len(rows) == len(expected)
         assert {(row["num_frames"], row["seed"], row["repeat"]) for row in rows} == expected
         assert all(set(row) == set(RECORD_KEYS) for row in rows)
         assert all(row["transformer_forward_count"] == {33: 12, 66: 18}[row["num_frames"]] for row in rows)
+        grouped: dict[tuple[int, int], set[str]] = {}
+        for row in rows:
+            digest = row["sha256"]
+            assert len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+            grouped.setdefault((row["num_frames"], row["seed"]), set()).add(digest)
+        assert all(len(values) == 1 for values in grouped.values())
+        hashes[name] = grouped
+    for name in ("FLASH_ATTN", "CUDNN_ATTN"):
+        assert hashes[name].keys() == hashes["TORCH_SDPA"].keys()
+        assert all(hashes[name][case] != hashes["TORCH_SDPA"][case] for case in hashes[name])
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["missing_group", "missing_backend", "missing_cell", "duplicate", "wrong_repeat", "wrong_seed", "extra_backend"],
+)
+def test_export_rejects_alignment_with_different_cells(change):
+    from benchmarks.diffusion.export_helios_attention import PROVENANCE_KEYS, RECORD_KEYS, build_artifact
+
+    runs = sample_runs()
+    alignment: dict = {"alignment_vs_torch_sdpa": {}, "self_variance": {}}
+    for name, run in runs.items():
+        run["metadata"]["repeats"] = 2
+        first = run["records"][0]
+        first.update({key: 1 for key in RECORD_KEYS if key not in first})
+        run["records"].append({**first, "repeat": 1})
+        run["summary"] = {"incorrect": "unused"}
+        alignment["alignment_vs_torch_sdpa"][name] = [{"num_frames": 33, "seed": 42, "repeat": 0}]
+        alignment["self_variance"][name] = [{"num_frames": 33, "seed": 42, "repeat": 1}]
+    if change == "missing_group":
+        del alignment["self_variance"]
+    elif change == "extra_backend":
+        alignment["self_variance"]["UNKNOWN"] = []
+    elif change == "missing_backend":
+        del alignment["self_variance"]["FLASH_ATTN"]
+    else:
+        rows = alignment["self_variance"]["FLASH_ATTN"]
+        if change == "missing_cell":
+            rows.clear()
+        elif change == "duplicate":
+            rows.append(dict(rows[0]))
+        elif change == "wrong_repeat":
+            rows[0]["repeat"] = 0
+        else:
+            rows[0]["seed"] = 7
+    provenance = {key: "historical" for key in PROVENANCE_KEYS}
+    with pytest.raises(ValueError, match="alignment.json"):
+        build_artifact(runs, alignment, provenance)

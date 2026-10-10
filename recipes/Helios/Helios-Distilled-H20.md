@@ -223,6 +223,10 @@ The checked-in JSON is a summary: it contains each measured request's aggregate
 wall/transformer timings, forward count, memory and output hash, plus alignment
 metrics. Full `transformer_timings` and `stage_durations_ms` remain in the raw
 per-backend `results.json` files; they are not included in the committed summary.
+The exporter checks that alignment groups contain exactly the matching
+measurement cases, without duplicates, and recomputes latency/memory summaries
+from the validated request records. It does not recompute image metrics; use the
+comparison tool on the corresponding raw arrays before exporting.
 The following exports that summary from the raw matrix:
 
 ```bash

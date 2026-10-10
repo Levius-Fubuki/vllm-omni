@@ -10,6 +10,7 @@ import argparse
 import json
 from pathlib import Path
 
+from benchmarks.diffusion.benchmark_helios_attention import summarize_runs
 from benchmarks.diffusion.compare_helios_attention import BACKENDS, validate_runs
 
 PROVENANCE_KEYS = (
@@ -37,6 +38,21 @@ RECORD_KEYS = (
 
 def build_artifact(runs: dict, alignment: dict, provenance: dict) -> dict:
     records = validate_runs(runs)
+    for group, first_repeat in (("alignment_vs_torch_sdpa", True), ("self_variance", False)):
+        backend_rows = alignment.get(group)
+        if not isinstance(backend_rows, dict) or set(backend_rows) != set(records):
+            raise ValueError(f"alignment.json missing or unexpected backends in {group}")
+        for name, keyed in records.items():
+            rows = backend_rows[name]
+            expected = {case for case in keyed if (case[2] == 0) == first_repeat}
+            if not isinstance(rows, list):
+                raise ValueError(f"alignment.json invalid rows: {group}, {name}")
+            try:
+                actual = {(row["num_frames"], row["seed"], row["repeat"]) for row in rows}
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"alignment.json malformed cells: {group}, {name}") from exc
+            if actual != expected or len(rows) != len(expected):
+                raise ValueError(f"alignment.json cells do not match measurements: {group}, {name}")
     excluded = {"model", "backend", "engine_startup_ms", "attention_implementations"}
     artifact = {key: provenance[key] for key in PROVENANCE_KEYS}
     artifact.update(
@@ -48,7 +64,7 @@ def build_artifact(runs: dict, alignment: dict, provenance: dict) -> dict:
     for name, data in runs.items():
         artifact["backends"][name] = {
             "attention_implementations": data["metadata"]["attention_implementations"],
-            "summary": data["summary"],
+            "summary": summarize_runs(list(records[name].values())),
             "measurements": [{key: row[key] for key in RECORD_KEYS} for row in records[name].values()],
         }
     return artifact
