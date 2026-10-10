@@ -17,6 +17,7 @@ import os
 import platform
 import statistics
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TypedDict
 
@@ -64,198 +65,203 @@ def main() -> None:
     pipeline_seedvr2.validate_clip_size(
         args.frames, args.height, args.width, pipeline_seedvr2.MAX_FRAME_PIXELS, pipeline_seedvr2.MAX_CLIP_PIXELS
     )
-    torch.backends.cudnn.benchmark = False
-    device_api = torch.get_device_module(current_omni_platform.device_type)
-    original_env = os.environ.get("VLLM_OMNI_SEEDVR2_DIT_CACHE")
-    active = False
-    stages: dict[str, float] = {}
-    captures: dict[str, torch.Tensor] = {}
-    cache_stats: dict[str, int] = {}
-    originals = []
+    with ExitStack() as cleanup:
+        device_api = torch.get_device_module(current_omni_platform.device_type)
+        original_env = os.environ.get("VLLM_OMNI_SEEDVR2_DIT_CACHE")
 
-    def wrap(owner, method, name):
-        original = getattr(owner, method)
-        originals.append((owner, method, original))
+        def restore_environment():
+            if original_env is None:
+                os.environ.pop("VLLM_OMNI_SEEDVR2_DIT_CACHE", None)
+            else:
+                os.environ["VLLM_OMNI_SEEDVR2_DIT_CACHE"] = original_env
 
-        @functools.wraps(original)
-        def measured(self, *positional, **keywords):
-            if not active:
-                return original(self, *positional, **keywords)
-            current_omni_platform.synchronize()
-            start = time.perf_counter()
-            result = original(self, *positional, **keywords)
-            current_omni_platform.synchronize()
-            stages[name] = time.perf_counter() - start
-            if name == "dit":
-                # Retain a reference only; hash/copy after the timed request.
-                captures["dit"] = result.vid_sample.detach()
-                runtime = keywords.get("runtime") or (positional[5] if len(positional) > 5 else None)
-                if runtime is not None:
-                    contexts = list(runtime._contexts.values())
-                    cache_stats.update(
-                        layouts=len(contexts),
-                        row_plans=sum(getattr(c, "sdpa_groups", None) is not None for c in contexts),
-                        rotary_builds=sum(c.rotary_cache.builds for c in contexts if hasattr(c, "rotary_cache")),
-                        rotary_hits=sum(c.rotary_cache.hits for c in contexts if hasattr(c, "rotary_cache")),
-                    )
-            return result
+        cleanup.callback(restore_environment)
+        cleanup.callback(setattr, torch.backends.cudnn, "benchmark", torch.backends.cudnn.benchmark)
+        torch.backends.cudnn.benchmark = False
+        active = False
+        stages: dict[str, float] = {}
+        captures: dict[str, torch.Tensor] = {}
+        cleanup.callback(captures.clear)
+        cache_stats: dict[str, int] = {}
 
-        setattr(owner, method, measured)
+        def wrap(owner, method, name):
+            original = getattr(owner, method)
+            cleanup.callback(setattr, owner, method, original)
 
-    wrap(vae.SeedVR2VAE, "encode", "vae_encode")
-    wrap(nadit.SeedVR2NaDiT, "forward", "dit")
-    wrap(vae.SeedVR2VAE, "decode", "vae_decode")
-    inputs = {
-        seed: torch.randint(
-            0,
-            256,
-            (args.frames, args.height, args.width, 3),
-            dtype=torch.uint8,
-            generator=torch.Generator().manual_seed(seed + 100),
-        )
-        for seed in (1101, 1102)
-    }
-    runs: list[BenchmarkRun] = []
-    report: dict[str, object] = dict(
-        protocol=dict(
-            height=args.height,
-            width=args.width,
-            frames=args.frames,
-            fps=24,
-            steps=1,
-            cfg=1.0,
-            dtype="float16",
-            eager=True,
-            vae_tiling=True,
-            color="lab",
-            num_gpus=1,
-            warmup_per_variant=1,
-            paired_rounds=args.rounds,
-            seeds=[1101, 1102],
-            timing="GPU-synchronized stage and request wall time; tensor hashes after timing",
-            task="same-resolution restoration; synthetic uint8 source; no MP4 encoding",
-        ),
-        software={name: importlib.metadata.version(name) for name in ("torch", "vllm", "vllm-omni", "numpy")},
-        hardware=dict(
-            platform=platform.machine(),
-            device=str(device_api.get_device_properties(0)),
-            host_memtotal=next(
-                (r for r in Path("/proc/meminfo").read_text().splitlines() if r.startswith("MemTotal:")), "unknown"
-            ),
-        ),
-        sources={
-            name: dict(
-                path=inspect.getfile(module),
-                sha256=hashlib.sha256(Path(inspect.getfile(module)).read_bytes()).hexdigest(),
-            )
-            for name, module in (("nadit", nadit), ("pipeline", pipeline_seedvr2), ("vae", vae))
-        },
-        input_sha256={str(seed): sha(frames) for seed, frames in inputs.items()},
-        runs=runs,
-    )
-    reference: dict[int, tuple[np.ndarray, torch.Tensor]] = {}
-    engine = None
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        engine = Omni(
-            model=args.model,
-            model_class_name="SeedVR2Pipeline",
-            dtype="float16",
-            enforce_eager=True,
-            vae_use_tiling=True,
-            num_gpus=1,
-        )
-
-        def request(enabled, seed):
-            os.environ["VLLM_OMNI_SEEDVR2_DIT_CACHE"] = "1" if enabled else "0"
-            return engine.generate(
-                {"prompt": " ", "multi_modal_data": {"video": inputs[seed]}},
-                OmniDiffusionSamplingParams(
-                    height=args.height,
-                    width=args.width,
-                    num_frames=args.frames,
-                    fps=24,
-                    num_inference_steps=1,
-                    guidance_scale=1.0,
-                    seed=seed,
-                    output_type="np",
-                    extra_args={"color_correction_method": "lab"},
-                ),
-                use_tqdm=False,
-            )
-
-        for enabled in (False,) if args.reference_only else (False, True):
-            request(enabled, 1101)
-        for round_index in range(args.rounds):
-            seed = 1101 + round_index % 2
-            variants = (False, True) if round_index % 2 == 0 else (True, False)
-            for enabled in (False,) if args.reference_only else variants:
-                stages.clear()
-                captures.clear()
-                cache_stats.clear()
-                device_api.reset_peak_memory_stats()
-                active = True
+            @functools.wraps(original)
+            def measured(self, *positional, **keywords):
+                if not active:
+                    return original(self, *positional, **keywords)
                 current_omni_platform.synchronize()
                 start = time.perf_counter()
-                output = request(enabled, seed)
+                result = original(self, *positional, **keywords)
                 current_omni_platform.synchronize()
-                elapsed = time.perf_counter() - start
-                active = False
-                assert set(stages) == {"vae_encode", "dit", "vae_decode"}, "requires single-process execution"
-                peak = dict(allocated=device_api.max_memory_allocated(), reserved=device_api.max_memory_reserved())
-                rgb = np.asarray(output[0].images[0])
-                latent = captures["dit"].cpu()
-                assert rgb.shape == (1, args.frames, args.height, args.width, 3) and rgb.dtype == np.uint8
-                if seed not in reference:
-                    reference[seed] = (rgb.copy(), latent)
-                ref_rgb, ref_latent = reference[seed]
-                exact_rgb, exact_dit = np.array_equal(rgb, ref_rgb), torch.equal(latent, ref_latent)
-                row = BenchmarkRun(
-                    round=round_index,
-                    seed=seed,
-                    cache=enabled,
-                    request_s=elapsed,
-                    stages_s=dict(stages),
-                    peak_bytes=peak,
-                    cache_stats=dict(cache_stats),
-                    dit_sha256=sha(latent),
-                    rgb_sha256=hashlib.sha256(rgb.tobytes()).hexdigest(),
-                    rgb_max_abs=int(np.abs(rgb.astype(np.int16) - ref_rgb.astype(np.int16)).max()),
-                    dit_bit_exact=exact_dit,
-                    rgb_bit_exact=exact_rgb,
+                stages[name] = time.perf_counter() - start
+                if name == "dit":
+                    # Retain a reference only; hash/copy after the timed request.
+                    captures["dit"] = result.vid_sample.detach()
+                    runtime = keywords.get("runtime") or (positional[5] if len(positional) > 5 else None)
+                    if runtime is not None:
+                        contexts = list(runtime._contexts.values())
+                        cache_stats.update(
+                            layouts=len(contexts),
+                            row_plans=sum(getattr(c, "sdpa_groups", None) is not None for c in contexts),
+                            rotary_builds=sum(c.rotary_cache.builds for c in contexts if hasattr(c, "rotary_cache")),
+                            rotary_hits=sum(c.rotary_cache.hits for c in contexts if hasattr(c, "rotary_cache")),
+                        )
+                return result
+
+            setattr(owner, method, measured)
+
+        wrap(vae.SeedVR2VAE, "encode", "vae_encode")
+        wrap(nadit.SeedVR2NaDiT, "forward", "dit")
+        wrap(vae.SeedVR2VAE, "decode", "vae_decode")
+        inputs = {
+            seed: torch.randint(
+                0,
+                256,
+                (args.frames, args.height, args.width, 3),
+                dtype=torch.uint8,
+                generator=torch.Generator().manual_seed(seed + 100),
+            )
+            for seed in (1101, 1102)
+        }
+        runs: list[BenchmarkRun] = []
+        report: dict[str, object] = dict(
+            protocol=dict(
+                height=args.height,
+                width=args.width,
+                frames=args.frames,
+                fps=24,
+                steps=1,
+                cfg=1.0,
+                dtype="float16",
+                eager=True,
+                vae_tiling=True,
+                color="lab",
+                num_gpus=1,
+                warmup_per_variant=1,
+                paired_rounds=args.rounds,
+                seeds=[1101, 1102],
+                timing="GPU-synchronized stage and request wall time; tensor hashes after timing",
+                task="same-resolution restoration; synthetic uint8 source; no MP4 encoding",
+            ),
+            software={name: importlib.metadata.version(name) for name in ("torch", "vllm", "vllm-omni", "numpy")},
+            hardware=dict(
+                platform=platform.machine(),
+                device=str(device_api.get_device_properties(0)),
+                host_memtotal=next(
+                    (r for r in Path("/proc/meminfo").read_text().splitlines() if r.startswith("MemTotal:")), "unknown"
+                ),
+            ),
+            sources={
+                name: dict(
+                    path=inspect.getfile(module),
+                    sha256=hashlib.sha256(Path(inspect.getfile(module)).read_bytes()).hexdigest(),
                 )
-                runs.append(row)
-                args.output.write_text(json.dumps(report, indent=2) + "\n")
-                print(json.dumps(row), flush=True)
-                assert exact_rgb and exact_dit, "cache changed output"
-                assert not enabled or cache_stats.get("rotary_hits", 0) > 0, "cache was not activated"
-                del output, rgb, latent
-        summary = {}
-        for enabled in (False, True):
-            selected_runs = [r for r in runs if r["cache"] == enabled]
-            if not selected_runs:
-                continue
-            summary[str(enabled)] = {
-                key: dict(mean_s=statistics.mean(values), stdev_s=statistics.stdev(values))
-                for key, values in [("request", [r["request_s"] for r in selected_runs])]
-                + [
-                    (stage, [r["stages_s"][stage] for r in selected_runs])
-                    for stage in ("vae_encode", "dit", "vae_decode")
-                ]
-            }
-        report["summary"] = summary
-        report["status"] = "PASS"
-    finally:
-        active = False
-        if engine is not None:
-            engine.close()
-        for owner, method, original in originals:
-            setattr(owner, method, original)
-        if original_env is None:
-            os.environ.pop("VLLM_OMNI_SEEDVR2_DIT_CACHE", None)
-        else:
-            os.environ["VLLM_OMNI_SEEDVR2_DIT_CACHE"] = original_env
-        args.output.write_text(json.dumps(report, indent=2) + "\n")
+                for name, module in (("nadit", nadit), ("pipeline", pipeline_seedvr2), ("vae", vae))
+            },
+            input_sha256={str(seed): sha(frames) for seed, frames in inputs.items()},
+            runs=runs,
+        )
+        reference: dict[int, tuple[np.ndarray, torch.Tensor]] = {}
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        # Write the report even if close fails; ExitStack still runs every restoration.
+        cleanup.callback(lambda: args.output.write_text(json.dumps(report, indent=2) + "\n"))
+        try:
+            engine = Omni(
+                model=args.model,
+                model_class_name="SeedVR2Pipeline",
+                dtype="float16",
+                enforce_eager=True,
+                vae_use_tiling=True,
+                num_gpus=1,
+            )
+
+            cleanup.callback(engine.close)
+
+            def request(enabled, seed):
+                os.environ["VLLM_OMNI_SEEDVR2_DIT_CACHE"] = "1" if enabled else "0"
+                return engine.generate(
+                    {"prompt": " ", "multi_modal_data": {"video": inputs[seed]}},
+                    OmniDiffusionSamplingParams(
+                        height=args.height,
+                        width=args.width,
+                        num_frames=args.frames,
+                        fps=24,
+                        num_inference_steps=1,
+                        guidance_scale=1.0,
+                        seed=seed,
+                        output_type="np",
+                        extra_args={"color_correction_method": "lab"},
+                    ),
+                    use_tqdm=False,
+                )
+
+            for enabled in (False,) if args.reference_only else (False, True):
+                request(enabled, 1101)
+            for round_index in range(args.rounds):
+                seed = 1101 + round_index % 2
+                variants = (False, True) if round_index % 2 == 0 else (True, False)
+                for enabled in (False,) if args.reference_only else variants:
+                    stages.clear()
+                    captures.clear()
+                    cache_stats.clear()
+                    device_api.reset_peak_memory_stats()
+                    active = True
+                    current_omni_platform.synchronize()
+                    start = time.perf_counter()
+                    output = request(enabled, seed)
+                    current_omni_platform.synchronize()
+                    elapsed = time.perf_counter() - start
+                    active = False
+                    assert set(stages) == {"vae_encode", "dit", "vae_decode"}, "requires single-process execution"
+                    peak = dict(allocated=device_api.max_memory_allocated(), reserved=device_api.max_memory_reserved())
+                    rgb = np.asarray(output[0].images[0])
+                    latent = captures["dit"].cpu()
+                    assert rgb.shape == (1, args.frames, args.height, args.width, 3) and rgb.dtype == np.uint8
+                    if seed not in reference:
+                        reference[seed] = (rgb.copy(), latent)
+                    ref_rgb, ref_latent = reference[seed]
+                    exact_rgb, exact_dit = np.array_equal(rgb, ref_rgb), torch.equal(latent, ref_latent)
+                    row = BenchmarkRun(
+                        round=round_index,
+                        seed=seed,
+                        cache=enabled,
+                        request_s=elapsed,
+                        stages_s=dict(stages),
+                        peak_bytes=peak,
+                        cache_stats=dict(cache_stats),
+                        dit_sha256=sha(latent),
+                        rgb_sha256=hashlib.sha256(rgb.tobytes()).hexdigest(),
+                        rgb_max_abs=int(np.abs(rgb.astype(np.int16) - ref_rgb.astype(np.int16)).max()),
+                        dit_bit_exact=exact_dit,
+                        rgb_bit_exact=exact_rgb,
+                    )
+                    runs.append(row)
+                    args.output.write_text(json.dumps(report, indent=2) + "\n")
+                    print(json.dumps(row), flush=True)
+                    assert exact_rgb and exact_dit, "cache changed output"
+                    assert not enabled or cache_stats.get("rotary_hits", 0) > 0, "cache was not activated"
+                    del output, rgb, latent
+            summary = {}
+            for enabled in (False, True):
+                selected_runs = [r for r in runs if r["cache"] == enabled]
+                if not selected_runs:
+                    continue
+                summary[str(enabled)] = {
+                    key: dict(mean_s=statistics.mean(values), stdev_s=statistics.stdev(values))
+                    for key, values in [("request", [r["request_s"] for r in selected_runs])]
+                    + [
+                        (stage, [r["stages_s"][stage] for r in selected_runs])
+                        for stage in ("vae_encode", "dit", "vae_decode")
+                    ]
+                }
+            report["summary"] = summary
+            report["status"] = "PASS"
+        finally:
+            active = False
+            captures.clear()
 
 
 if __name__ == "__main__":
