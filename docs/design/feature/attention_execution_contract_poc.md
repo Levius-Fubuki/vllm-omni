@@ -27,8 +27,10 @@ Verified inference paths declare `TRACEABLE` for equal Q/KV heads and
 `CUSTOM_OP` for GQA. The equal-head path passes a concrete boolean to SDPA;
 the compiled CUDA GQA path wraps the runtime `SDPAParams` probe and native/
 expanded-KV dispatch in an opaque custom op. Both eager execution and the
-custom op use the same SDPA helper. The op returns contiguous BHSD output so
-its fake implementation can declare exact strides; the caller restores BSHD.
+custom op use the same SDPA helper. The op transposes the SDPA result before
+making it contiguous, returning BSHD directly to the caller. Its fake output
+declares the same shape and strides, with V setting the output head dimension.
+Flattening the output heads is a view rather than a subsequent layout copy.
 Eager calls and non-CUDA entrypoints do not use this custom-op boundary.
 Autograd fullgraph execution is not verified: inputs requiring gradients
 retain `EAGER_ONLY` and bypass the inference-only custom op. A gradient-bearing
@@ -64,8 +66,19 @@ eager fallback with graph breaks. With these and conservative capability
 guards, the focused suite passes 137 tests on the same RTX 4090 environment. This
 does not claim training, end-to-end model, CUDA-graph capture, or performance
 coverage, nor guarantee one graph across arbitrary shapes.
-The contiguous BHSD boundary may introduce an output copy and a subsequent
-reshape copy; realistic-shape performance impact has not been benchmarked.
+The contiguous BSHD boundary may still require an output copy, depending on
+the SDPA kernel's layout; realistic-shape performance impact has not been benchmarked.
+
+The BSHD layout follow-up was validated on an A800 80GB PCIe (SM80, driver
+595.71.05), Python 3.12.3, PyTorch 2.13.0+cu130, and vLLM 0.30.0. Four new
+CPU cases check masked/unmasked outputs with equal and unequal Q/V head
+dimensions, contiguous BSHD layout, numerics, and storage sharing when
+flattening heads. Eight CUDA `opcheck` cases cover schema, fake strides, and
+dynamic AOT dispatch, including unequal V dimensions. The existing dynamic
+fullgraph cases also check contiguous GQA outputs and view-only head flattening.
+The focused suite passed 145 tests; the ready-CI-style selection passed 99
+CUDA cases on A800, and hiding CUDA skipped all 99 GPU cases. The L4 resource
+marker remains CI routing and does not imply L4 hardware validation.
 
 ## Execution contract
 

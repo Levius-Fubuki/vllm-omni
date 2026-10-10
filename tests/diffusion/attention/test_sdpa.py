@@ -11,6 +11,27 @@ from vllm_omni.diffusion.attention.capabilities import ExecutionContext, Support
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("value_dim", [4, 8])
+@pytest.mark.parametrize("masked", [False, True])
+def test_sdpa_gqa_custom_op_returns_contiguous_bshd(value_dim, masked):
+    query = torch.randn(2, 3, 4, 8).permute(0, 2, 1, 3)
+    key = torch.randn(2, 5, 2, 8).permute(0, 2, 1, 3)
+    value = torch.randn(2, 5, 2, value_dim).permute(0, 2, 1, 3)
+    mask = torch.ones(2, 1, 1, 5, dtype=torch.bool) if masked else None
+    if mask is not None:
+        mask[..., -1] = False
+
+    output = torch.ops.vllm_omni.sdpa_gqa_attention(query, key, value, mask, False, 8**-0.5)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query, key.repeat_interleave(2, dim=1), value.repeat_interleave(2, dim=1), attn_mask=mask, scale=8**-0.5
+    ).permute(0, 2, 1, 3)
+
+    assert output.shape == (2, 3, 4, value_dim)
+    assert output.is_contiguous()
+    assert output.flatten(2).untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+    torch.testing.assert_close(output, expected)
+
+
 def test_sdpa_expands_kv_when_native_gqa_kernel_is_unavailable(monkeypatch):
     calls = []
 

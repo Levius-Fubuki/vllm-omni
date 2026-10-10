@@ -80,8 +80,8 @@ if not hasattr(torch.ops.vllm_omni, "sdpa_gqa_attention"):
         scale: float,
     ) -> torch.Tensor:
         # Keep SDPAParams and runtime kernel selection opaque to Dynamo.
-        # Normalize the layout so fake and real outputs have identical strides.
-        return _sdpa_attention(query, key, value, attention_mask, causal, scale).contiguous()
+        # Return contiguous BSHD so fake strides match and flattening heads is a view.
+        return _sdpa_attention(query, key, value, attention_mask, causal, scale).permute(0, 2, 1, 3).contiguous()
 
     @_sdpa_gqa_attention_op.register_fake
     def _sdpa_gqa_attention_fake(
@@ -92,7 +92,7 @@ if not hasattr(torch.ops.vllm_omni, "sdpa_gqa_attention"):
         causal: bool,
         scale: float,
     ) -> torch.Tensor:
-        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+        return query.new_empty((query.shape[0], query.shape[2], query.shape[1], value.shape[-1]))
 
 
 _sdpa_gqa_attention_op = torch.ops.vllm_omni.sdpa_gqa_attention
@@ -312,11 +312,9 @@ class SDPAImpl(AttentionImpl):
                 query, key, value = (_cast_sdpa_autocast_input(tensor, dtype) for tensor in (query, key, value))
                 if attention_mask is not None:
                     attention_mask = _cast_sdpa_autocast_input(attention_mask, dtype)
-            output = _sdpa_gqa_attention_op(query, key, value, attention_mask, self.causal, self.softmax_scale)
-        else:
-            output = _sdpa_attention(query, key, value, attention_mask, self.causal, self.softmax_scale)
-        out = output.permute(0, 2, 1, 3)
-        return out
+            return _sdpa_gqa_attention_op(query, key, value, attention_mask, self.causal, self.softmax_scale)
+        output = _sdpa_attention(query, key, value, attention_mask, self.causal, self.softmax_scale)
+        return output.permute(0, 2, 1, 3)
 
     def forward_cuda(
         self,

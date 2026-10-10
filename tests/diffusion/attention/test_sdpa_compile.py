@@ -45,6 +45,9 @@ def test_sdpa_dynamic_fullgraph_matches_eager(q_heads, kv_heads, head_dim, dtype
                 metadata = AttentionMetadata(attn_mask=mask, extra={"attention_mask_mode": "padding"})
             expected = impl.forward_cuda(query, key, value, metadata)
             actual = compiled(query, key, value, metadata)
+            if q_heads != kv_heads:
+                assert actual.is_contiguous()
+                assert actual.flatten(2).untyped_storage().data_ptr() == actual.untyped_storage().data_ptr()
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
@@ -79,12 +82,17 @@ def test_sdpa_production_attention_fullgraph(monkeypatch, q_heads, kv_heads, hea
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("head_dim", [64, 512])
+@pytest.mark.parametrize("unequal_value_dim", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
-def test_sdpa_gqa_custom_op_schema_and_fake(head_dim, masked):
+def test_sdpa_gqa_custom_op_schema_and_fake(head_dim, unequal_value_dim, masked):
     query = torch.randn(2, 3, 8, head_dim, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
     key = torch.randn(2, 7, 2, head_dim, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
-    value = torch.randn_like(key)
+    value_dim = head_dim // 2 if unequal_value_dim else head_dim
+    value = torch.randn(2, 7, 2, value_dim, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
     mask = torch.ones(2, 1, 1, 7, device="cuda", dtype=torch.bool) if masked else None
+    output = torch.ops.vllm_omni.sdpa_gqa_attention(query, key, value, mask, False, head_dim**-0.5)
+    assert output.shape == (2, 3, 8, value_dim)
+    assert output.is_contiguous()
     torch.library.opcheck(
         torch.ops.vllm_omni.sdpa_gqa_attention.default,
         (query, key, value, mask, False, head_dim**-0.5),
