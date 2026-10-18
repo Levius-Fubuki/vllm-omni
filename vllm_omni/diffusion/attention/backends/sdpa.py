@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from typing import Literal
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -27,6 +29,12 @@ logger = init_logger(__name__)
 SDPAMaskMode = Literal["broadcast_k", "full_qk"]
 
 
+def _sdpa_preserves_float_bias(query: torch.Tensor, attention_mask: torch.Tensor | None) -> bool:
+    # Some fused kernels advertise support but reject FP32 additive bias
+    # with low-precision Q. Preserve bias precision in the math kernel.
+    return attention_mask is not None and attention_mask.is_floating_point() and attention_mask.dtype != query.dtype
+
+
 def _sdpa_uses_expanded_kv(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -35,7 +43,10 @@ def _sdpa_uses_expanded_kv(
     causal: bool,
 ) -> bool:
     """Match the forward path's fused-GQA decision on SDPA-layout tensors."""
-    return query.shape[1] != key.shape[1] and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, causal)
+    return query.shape[1] != key.shape[1] and (
+        _sdpa_preserves_float_bias(query, attention_mask)
+        or not can_sdpa_use_fused_gqa(query, key, value, attention_mask, causal)
+    )
 
 
 def _sdpa_attention(
@@ -60,12 +71,19 @@ def _sdpa_attention(
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
             enable_gqa = False
-            logger.debug(
-                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
-            )
-    return torch.nn.functional.scaled_dot_product_attention(
-        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=causal, scale=scale, enable_gqa=enable_gqa
-    )
+            if not torch.compiler.is_compiling():
+                logger.debug("SDPA is expanding K/V heads for the selected GQA execution path.")
+    with sdpa_kernel(SDPBackend.MATH) if _sdpa_preserves_float_bias(query, attention_mask) else nullcontext():
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
 
 
 if not hasattr(torch.ops.vllm_omni, "sdpa_gqa_attention"):
@@ -147,6 +165,20 @@ class SDPABackend(AttentionBackend):
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
+    @classmethod
+    def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
+    @classmethod
+    def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
+        return kv_heads > 0 and q_heads % kv_heads == 0
+
+    @classmethod
+    def supports_cross_pair_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         return True
 
