@@ -141,3 +141,28 @@ def test_sdpa_fullgraph_autocast_output_dtype(kv_heads, head_dim, source_dtype, 
         actual = compiled(query, key, value, metadata)
         assert actual.dtype is expected.dtype
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("kv_heads", [8, 2])
+def test_sdpa_fullgraph_preserves_float_bias_precision(kv_heads):
+    impl = SDPAImpl(num_heads=8, num_kv_heads=kv_heads, head_size=64, softmax_scale=64**-0.5)
+    compiled = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
+    with torch.inference_mode():
+        query = torch.randn(2, 5, 8, 64, device="cuda", dtype=torch.bfloat16)
+        key = torch.randn(2, 9, kv_heads, 64, device="cuda", dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        # 2D masks become boolean padding; a 4D FP32 bias reaches SDPA unchanged.
+        bias = torch.randn(2, 1, 5, 9, device="cuda", dtype=torch.float32)
+        metadata = AttentionMetadata(attn_mask=bias)
+        repeat = 8 // kv_heads
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query.float().transpose(1, 2),
+            key.float().repeat_interleave(repeat, dim=2).transpose(1, 2),
+            value.float().repeat_interleave(repeat, dim=2).transpose(1, 2),
+            attn_mask=bias,
+            scale=64**-0.5,
+        ).transpose(1, 2)
+        for actual in (impl.forward_cuda(query, key, value, metadata), compiled(query, key, value, metadata)):
+            assert actual.dtype is torch.bfloat16
+            torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
