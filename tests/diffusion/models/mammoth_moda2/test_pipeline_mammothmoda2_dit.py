@@ -44,6 +44,8 @@ from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
+from .helpers import initialize_block_weights
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -590,7 +592,7 @@ def single_rank_world(monkeypatch, tmp_path):
     reason="vLLM ROCm custom ops lack CPU fallback",
 )
 def test_forward_transitions_request_scoped_cache_dit_across_requests(
-    request: pytest.FixtureRequest, single_rank_world
+    request: pytest.FixtureRequest, mock_tp1, single_rank_world
 ) -> None:
     """Cache-DiT request lifecycle on one production-built pipeline instance.
 
@@ -610,6 +612,7 @@ def test_forward_transitions_request_scoped_cache_dit_across_requests(
     torch.manual_seed(0)  # Deterministic random init → deterministic cache hits.
     with _force_torch_sdpa():
         pipeline = MammothModa2DiTPipeline(od_config=_cache_dit_od_config())
+    initialize_block_weights(pipeline.gen_transformer)
     pipeline.eval()
     assert pipeline._cache_dit_config is not None
     request.addfinalizer(pipeline._cache_dit_runtime.disable)
