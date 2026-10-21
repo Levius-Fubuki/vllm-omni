@@ -1,4 +1,4 @@
-# Helios-Distilled attention backends on H20
+# Helios-Distilled attention backends on H20 (historical runtime)
 
 ## Summary
 
@@ -8,13 +8,17 @@
 - Mode: Offline, one request at a time
 - Hardware: One NVIDIA H20, 96 GB
 - Maintainer: Community
+- Runtime scope: Historical H20 experiment at `b63e35a` (2026-09-27)
 
 ## When to use this recipe
 
-Use this recipe to compare dense attention backends on the same
-Helios-Distilled workload. It covers request latency and output alignment on
-H20. It does not measure concurrent serving throughput or compare the
-Distilled checkpoint with Helios-Base.
+This recipe records a dense attention comparison on Helios-Distilled at runtime
+commit `b63e35ab4ffae2f78b556150943ec0e08a444030`, with `fa3-fwd==0.0.3`
+installed. All recorded timings, memory figures, output-alignment results and
+backend recommendations apply to that historical H20 environment. Current main
+uses a different FlashAttention provider and needs its own measurements. This
+recipe does not measure concurrent serving throughput or compare the Distilled
+checkpoint with Helios-Base.
 
 ## Supported model contract
 
@@ -68,7 +72,9 @@ budget estimate, not a measured minimum RAM or GPU requirement.
 - Interconnect: No inter-GPU communication is used.
 - Scope: Single-device offline generation; other GPUs require separate validation.
 
-## Software environment
+## Historical software environment
+
+The following versions describe the September 27 experiment at `b63e35a`.
 
 | Component | Validated version |
 | --- | --- |
@@ -82,17 +88,54 @@ budget estimate, not a measured minimum RAM or GPU requirement.
 | FlashAttention 3 forward package | `fa3-fwd==0.0.3` |
 | NumPy / scikit-image | 2.3.5 / 0.26.0 |
 
-Start from the [source installation guide](../../docs/getting_started/installation/README.md)
-and use the versions above to reproduce this environment. The FlashAttention
-package is the FA3 forward wheel, not an interchangeable FA2 build. The
-benchmark records the selected attention implementation from the worker. New
-runs also record the resolved `flash_attn_func` and `flash_attn_varlen_func`
-module/qualified names under `attention_implementations.flash_attention_bindings`.
+Use the [source installation guide at the measured runtime](https://github.com/vllm-project/vllm-omni/blob/b63e35ab4ffae2f78b556150943ec0e08a444030/docs/getting_started/installation/README.md)
+with the versions above. `fa3-fwd==0.0.3` is part of this historical environment,
+not an installation recommendation for current main. At `b63e35a`, the H20 CUDA
+resolver tried `fa3_fwd_interface` before other FlashAttention providers. The
+benchmark recorded the selected attention wrapper; newer benchmark helpers also
+record the resolved `flash_attn_func` and `flash_attn_varlen_func` module/qualified
+names under `attention_implementations.flash_attention_bindings`.
 The September 27 artifact predates this field: it records wrapper counts and
 installed package versions, but does not independently establish the bound
 provider. Its historical metadata and script hashes are preserved.
 
-## Reproduce the comparison
+### Current main uses a different provider
+
+[PR #7735](https://github.com/vllm-project/vllm-omni/pull/7735) removed the
+`fa3-fwd` CUDA dependency and its resolver import. On the H20 CUDA path after
+that change, `FLASH_ATTN` uses the available `vllm.vllm_flash_attn` dispatcher.
+Installing `fa3-fwd` on current main does not restore the old resolver path.
+The dispatcher chooses the kernel according to vLLM and device configuration;
+its module name alone does not establish a particular FlashAttention version.
+
+The current-main provider has not been benchmarked by this recipe. Do not
+apply the historical speedups or backend ranking to it. For a new comparison,
+rerun all three backends on the same current runtime and record the resolved
+bindings and software environment.
+
+## Reproduce the historical comparison
+
+To run against the measured runtime, create a separate checkout and copy this
+PR's benchmark/analysis helpers and saved summary into it. From this PR's
+repository root:
+
+```bash
+git worktree add --detach ../vllm-omni-helios-b63e35a \
+  b63e35ab4ffae2f78b556150943ec0e08a444030
+cp benchmarks/diffusion/benchmark_helios_attention.py \
+  benchmarks/diffusion/compare_helios_attention.py \
+  benchmarks/diffusion/export_helios_attention.py \
+  ../vllm-omni-helios-b63e35a/benchmarks/diffusion/
+cp recipes/Helios/Helios-Distilled-H20-results.json \
+  ../vllm-omni-helios-b63e35a/recipes/Helios/
+cd ../vllm-omni-helios-b63e35a
+```
+
+In a separate environment, install this checkout using the historical source
+installation guide and version table above, including `fa3-fwd==0.0.3`. The
+copied helpers add instrumentation; they do not replace the pinned runtime's
+attention resolver. They contain review improvements, so new result provenance
+must record their actual script hashes rather than reuse the historical hashes.
 
 This is a Helios-specific offline harness for the fixed A2 workload. Follow-up
 Helios comparisons can reuse it with the same measurement contract. Its location
@@ -149,7 +192,8 @@ before attributing output differences to the backend choice.
 
 ## Measured latency and memory
 
-Measured on 2026-09-27 with the environment above. Each row summarizes nine
+Measured on 2026-09-27 at runtime `b63e35a` with `fa3-fwd==0.0.3` installed
+and the historical environment above. Each row summarizes nine
 requests (three prompt/seed pairs, three repetitions), after one excluded
 warmup for that frame count. All 54 measured requests completed. Values in
 parentheses are the minimum and maximum request wall times.
@@ -163,7 +207,7 @@ parentheses are the minimum and maximum request wall times.
 | `FLASH_ATTN` | 66 | 32820.8 (32802.0–32843.0) | 29508.8 | 1639.4 | 46.47 |
 | `CUDNN_ATTN` | 66 | 32827.0 (32813.5–32843.0) | 29514.0 | 1639.7 | 46.47 |
 
-Relative to `TORCH_SDPA`, `FLASH_ATTN` (with `fa3-fwd` installed) reduced median request latency by **9.14%** for
+On `b63e35a`, relative to `TORCH_SDPA`, `FLASH_ATTN` (with `fa3-fwd==0.0.3` installed) reduced median request latency by **9.14%** for
 33 frames and **8.95%** for 66 frames. Transformer device time fell by about
 9.85%. cuDNN delivered effectively the same latency as `FLASH_ATTN`: their differences
 of 2.2/6.2 ms are smaller than the observed within-backend ranges. Peak worker
@@ -243,7 +287,9 @@ original September 27 raw matrix only, use the checked-in
 must supply its own provenance; the exporter never hashes today's scripts and
 attributes them to a historical run.
 
-### Observed alignment
+### Observed alignment on the historical runtime
+
+These results use the same `b63e35a` runtime and environment as the latency table.
 
 All 12 repeated outputs within **each** backend were byte-identical to that
 backend's first output for the same prompt/seed/frame count (36/36 comparisons).
@@ -253,7 +299,7 @@ are normalized to `[0, 1]`.
 
 | Backend versus SDPA | MAE | RMSE | PSNR, dB | Mean frame SSIM | Temporal-delta MAE | Largest pixel error |
 | --- | --- | --- | --- | --- | --- | ---: |
-| `FLASH_ATTN` (`fa3-fwd` installed) | 0.00620–0.01472 | 0.01593–0.04238 | 27.46–35.95 | 0.93431–0.98788 | 0.00447–0.01337 | 1.00000 |
+| `FLASH_ATTN` (`b63e35a`, `fa3-fwd==0.0.3` installed) | 0.00620–0.01472 | 0.01593–0.04238 | 27.46–35.95 | 0.93431–0.98788 | 0.00447–0.01337 | 1.00000 |
 | cuDNN | 0.00633–0.01368 | 0.01555–0.04088 | 27.77–36.16 | 0.94409–0.98712 | 0.00500–0.01096 | 0.99778 |
 
 Average alignment does not imply pixel-level equivalence: the largest local
@@ -261,22 +307,25 @@ differences approach the full pixel range. These six cases provide a measured
 tradeoff, not a broad quality acceptance threshold or a reason to change the
 global default. Exact repetitions here describe this single-session setup.
 
-## Backend choice and a validated command
+## Historical backend choice and validated command
 
 The reported speedups use explicitly selected `TORCH_SDPA` as the baseline.
-On H20, automatic selection already prefers `FLASH_ATTN` when a supported
-FlashAttention implementation imports successfully. These numbers are therefore
+On that H20 runtime, automatic selection already preferred `FLASH_ATTN` when a
+supported FlashAttention implementation imported successfully. These numbers are therefore
 not an improvement over the existing automatic default.
 
-For latency-oriented use of this H20 configuration, `FLASH_ATTN` with the
-specified FA3 package and `CUDNN_ATTN` are both viable options, with effectively
-tied performance. Evaluate the output differences on your own prompts before
-switching an established workload. Keep `TORCH_SDPA` when reproducing these
+For latency-oriented use of the historical `b63e35a` H20 environment,
+`FLASH_ATTN` with `fa3-fwd==0.0.3` installed and `CUDNN_ATTN` had effectively
+tied performance. This is a recommendation for that pinned environment only;
+current main's vLLM dispatcher needs separate validation. Evaluate the output
+differences on your own prompts before switching an established workload. Keep `TORCH_SDPA` when reproducing these
 SDPA reference outputs is the priority. This recipe does not recommend Sage,
 quantization, or a backend choice for other hardware.
 
-The following `FLASH_ATTN` command uses the shared example in a fresh process for one
-request, so it does not reuse a previous request's prompt cache:
+The following `FLASH_ATTN` command was validated on `b63e35a` with the historical
+software versions above. Run it from the historical checkout prepared earlier.
+It uses the shared example in a fresh process for one request, so it does not
+reuse a previous request's prompt cache:
 
 ```bash
 DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN \
@@ -289,7 +338,7 @@ python examples/offline_inference/text_to_video/text_to_video.py \
   --num-inference-steps 6 --guidance-scale 1.0 \
   --fps 16 --enforce-eager \
   --extra-body '{"is_enable_stage2":true,"pyramid_num_inference_steps_list":[2,2,2],"is_amplify_first_chunk":true}' \
-  --output helios-distilled-fa3.mp4
+  --output helios-distilled-flash-attn.mp4
 ```
 
 The output should be a generated 33-frame, 640 × 384 video at 16 FPS. This
