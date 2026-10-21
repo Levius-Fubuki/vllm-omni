@@ -30,9 +30,9 @@ def describe_flash_bindings(provider) -> dict:
     """Record resolved callables, not just the attention wrapper or wheel version."""
     return {
         name: None
-        if (func := getattr(provider, name)) is None
+        if (func := getattr(provider, name, None)) is None
         else {"module": func.__module__, "qualname": func.__qualname__}
-        for name in ("flash_attn_func", "flash_attn_varlen_func")
+        for name in ("flash_attn_func", "flash_attn_varlen_func", "optional_fa3_fwd_dense_func")
     }
 
 

@@ -16,9 +16,10 @@ This recipe records a dense attention comparison on Helios-Distilled at runtime
 commit `b63e35ab4ffae2f78b556150943ec0e08a444030`, with `fa3-fwd==0.0.3`
 installed. All recorded timings, memory figures, output-alignment results and
 backend recommendations apply to that historical H20 environment. Current main
-uses a different FlashAttention provider and needs its own measurements. This
-recipe does not measure concurrent serving throughput or compare the Distilled
-checkpoint with Helios-Base.
+selects its provider according to the hardware, attention path and optional
+packages; its performance needs separate measurements. This recipe does not
+measure concurrent serving throughput or compare the Distilled checkpoint with
+Helios-Base.
 
 ## Supported model contract
 
@@ -93,25 +94,36 @@ with the versions above. `fa3-fwd==0.0.3` is part of this historical environment
 not an installation recommendation for current main. At `b63e35a`, the H20 CUDA
 resolver tried `fa3_fwd_interface` before other FlashAttention providers. The
 benchmark recorded the selected attention wrapper; newer benchmark helpers also
-record the resolved `flash_attn_func` and `flash_attn_varlen_func` module/qualified
-names under `attention_implementations.flash_attention_bindings`.
+record the resolved `flash_attn_func`, `flash_attn_varlen_func` and
+`optional_fa3_fwd_dense_func` module/qualified names under
+`attention_implementations.flash_attention_bindings`. A binding absent from an
+older runtime is recorded as `null`, so these helpers also work on `b63e35a`.
 The September 27 artifact predates this field: it records wrapper counts and
 installed package versions, but does not independently establish the bound
 provider. Its historical metadata and script hashes are preserved.
 
-### Current main uses a different provider
+### Main after #9201: optional Hopper dense FA3
 
-[PR #7735](https://github.com/vllm-project/vllm-omni/pull/7735) removed the
-`fa3-fwd` CUDA dependency and its resolver import. On the H20 CUDA path after
-that change, `FLASH_ATTN` uses the available `vllm.vllm_flash_attn` dispatcher.
-Installing `fa3-fwd` on current main does not restore the old resolver path.
-The dispatcher chooses the kernel according to vLLM and device configuration;
-its module name alone does not establish a particular FlashAttention version.
+[PR #7735](https://github.com/vllm-project/vllm-omni/pull/7735) removed
+`fa3-fwd` as a required CUDA dependency.
+[PR #9201](https://github.com/vllm-project/vllm-omni/pull/9201) restored it as an
+optional dense kernel on Hopper (SM90), including H20. For this recipe's BF16,
+unmasked Helios self- and cross-attention calls, an importable `fa3-fwd` supplies
+`fa3_fwd_interface.flash_attn_func` through `fa.optional_fa3_fwd_dense_func`.
+Without that optional binding, these H20 calls use the available
+`vllm.vllm_flash_attn` dispatcher. The optional dense route excludes FP16;
+masked, packed, piecewise and FP8 paths keep their separate dispatch routes.
 
-The current-main provider has not been benchmarked by this recipe. Do not
-apply the historical speedups or backend ranking to it. For a new comparison,
-rerun all three backends on the same current runtime and record the resolved
-bindings and software environment.
+`flash_attn_func` can remain `None` even when the optional dense function is
+bound, so record all three callable bindings. On the vLLM dispatcher route,
+the selected kernel depends on vLLM and device configuration; the module name
+alone does not establish a particular FlashAttention version.
+
+With `fa3-fwd` installed, these current-main Helios calls can use the same dense
+entry point preferred by the historical `b63e35a` resolver. That does not make
+the September timings a measurement of current main. For a new comparison,
+rerun all three backends on the same runtime and record the resolved bindings
+and software environment.
 
 ## Reproduce the historical comparison
 
@@ -317,9 +329,10 @@ not an improvement over the existing automatic default.
 For latency-oriented use of the historical `b63e35a` H20 environment,
 `FLASH_ATTN` with `fa3-fwd==0.0.3` installed and `CUDNN_ATTN` had effectively
 tied performance. This is a recommendation for that pinned environment only;
-current main's vLLM dispatcher needs separate validation. Evaluate the output
-differences on your own prompts before switching an established workload. Keep `TORCH_SDPA` when reproducing these
-SDPA reference outputs is the priority. This recipe does not recommend Sage,
+current main needs separate performance validation whether it selects optional
+Hopper FA3 or the vLLM dispatcher. Evaluate the output differences on your own
+prompts before switching an established workload. Keep `TORCH_SDPA` when
+reproducing these SDPA reference outputs is the priority. This recipe does not recommend Sage,
 quantization, or a backend choice for other hardware.
 
 The following `FLASH_ATTN` command was validated on `b63e35a` with the historical

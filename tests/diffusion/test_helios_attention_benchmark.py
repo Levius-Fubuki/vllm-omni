@@ -57,6 +57,34 @@ def test_flash_bindings_describe_resolved_functions():
     result = describe_flash_bindings(SimpleNamespace(flash_attn_func=forward, flash_attn_varlen_func=None))
     assert result["flash_attn_func"] == {"module": "fa3_fwd_interface", "qualname": forward.__qualname__}
     assert result["flash_attn_varlen_func"] is None
+    assert result["optional_fa3_fwd_dense_func"] is None
+
+
+def test_flash_bindings_capture_optional_hopper_dense_kernel():
+    from types import SimpleNamespace
+
+    from benchmarks.diffusion.benchmark_helios_attention import describe_flash_bindings
+
+    def dense():
+        pass
+
+    def varlen():
+        pass
+
+    dense.__module__ = "fa3_fwd_interface"
+    varlen.__module__ = "vllm.vllm_flash_attn"
+    result = describe_flash_bindings(
+        SimpleNamespace(
+            flash_attn_func=None,
+            flash_attn_varlen_func=varlen,
+            optional_fa3_fwd_dense_func=dense,
+        )
+    )
+    assert result == {
+        "flash_attn_func": None,
+        "flash_attn_varlen_func": {"module": "vllm.vllm_flash_attn", "qualname": varlen.__qualname__},
+        "optional_fa3_fwd_dense_func": {"module": "fa3_fwd_interface", "qualname": dense.__qualname__},
+    }
 
 
 @pytest.mark.parametrize(
