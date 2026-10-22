@@ -84,6 +84,10 @@ _TOKEN_ID_PROMPT_FIELDS = (
     "negative_prompt_ids",
     "negative_prompt_token_ids",
 )
+# Prompt embeddings remain unsupported even when the wrapped pipeline accepts
+# them. Supporting them requires extracting companion embeddings, mapping
+# pipeline-specific masks, and handling text/embedding exclusivity; signature
+# checks alone are insufficient. That support is outside this validation fix.
 _UNSUPPORTED_PROMPT_FIELDS = (
     *_TOKEN_ID_PROMPT_FIELDS,
     "prompt_mask",
@@ -517,6 +521,11 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         """Reject conditioning inputs that this adapter does not consume."""
         for index, prompt in enumerate(prompt_obj):
             if isinstance(prompt, (list, tuple)):
+                if not prompt:
+                    raise ValueError(
+                        f"DiffusersAdapterPipeline received an empty prompt at index {index}. "
+                        "Pass text through `prompt` or provide `multi_modal_data`."
+                    )
                 raise ValueError(
                     "DiffusersAdapterPipeline does not support a token-ID prompt "
                     f"at index {index}. Pass text through `prompt` or use a native "
@@ -541,6 +550,13 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     "DiffusersAdapterPipeline does not support prompt field(s) "
                     f"at index {index}: {fields}. Pass text through `prompt` or use a native "
                     "pipeline that supports these conditioning inputs."
+                )
+
+            # Preserve explicitly supplied empty text and image-only requests.
+            if prompt.get("prompt") is None and not prompt.get("multi_modal_data"):
+                raise ValueError(
+                    f"DiffusersAdapterPipeline received an empty prompt at index {index}. "
+                    "Pass text through `prompt` or provide `multi_modal_data`."
                 )
 
     def _extract_input(self, prompt_obj: list[OmniPromptType]) -> dict[str, Any]:

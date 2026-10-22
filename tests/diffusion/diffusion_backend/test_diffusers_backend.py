@@ -202,6 +202,78 @@ class TestPipelineArgumentsHandling:
 
         assert kwargs["prompt"] == "a supported text prompt"
 
+    @pytest.mark.parametrize(
+        "field",
+        ("prompt_ids", "prompt_token_ids", "negative_prompt_ids", "negative_prompt_token_ids"),
+    )
+    @pytest.mark.parametrize("empty_ids", ([], ()))
+    def test_adapter_rejects_empty_id_fields_without_text_or_multimodal_data(self, field, empty_ids):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = {field: empty_ids}
+
+        with pytest.raises(ValueError, match="empty prompt at index 0"):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    @pytest.mark.parametrize(
+        "prompt",
+        ({}, {"prompt": None}, {"multi_modal_data": {}}, {"negative_prompt": "blurry"}),
+    )
+    def test_adapter_rejects_dict_without_text_or_multimodal_data(self, prompt):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = prompt
+
+        with pytest.raises(ValueError, match="empty prompt at index 0"):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    @pytest.mark.parametrize("prompt", ([], ()))
+    def test_adapter_reports_bare_empty_sequence_as_empty_prompt(self, prompt):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = prompt
+
+        with pytest.raises(ValueError, match="empty prompt at index 0"):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    @pytest.mark.parametrize("prompt", ({"prompt_ids": []}, []))
+    def test_adapter_rejects_empty_nonfirst_prompt(self, prompt):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+
+        with pytest.raises(ValueError, match="empty prompt at index 1"):
+            adapter._extract_input(["first prompt", prompt])
+
+    @pytest.mark.parametrize("prompt", ("", {"prompt": ""}, {"prompt": "", "prompt_ids": []}))
+    def test_adapter_preserves_explicit_empty_text_prompt(self, prompt):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = prompt
+
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+        assert kwargs["prompt"] == ""
+
+    @pytest.mark.parametrize(
+        "empty_id_fields",
+        (
+            {},
+            {"prompt_ids": []},
+            {"prompt_token_ids": []},
+            {"negative_prompt_ids": []},
+            {"negative_prompt_token_ids": []},
+        ),
+    )
+    def test_adapter_preserves_multimodal_prompt_without_text(self, empty_id_fields):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        image = Image.new("RGB", (16, 16))
+        request = _make_request()
+        request.prompt = {"multi_modal_data": {"image": image}, **empty_id_fields}
+
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+        assert kwargs["prompt"] == ""
+        assert kwargs["image"] is image
+
     def test_adapter_rejects_unsupported_field_in_nonfirst_prompt(self):
         adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
 
